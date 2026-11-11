@@ -19,9 +19,11 @@ Design proposal plus a bare skeleton. The PoC is not implemented yet; see [CLAUD
 
 ## Build
 
-Requires JDK 21 and Docker (for Testcontainers). Generate the Gradle wrapper once with a local Gradle install:
+Requires JDK 21 and Docker (for Testcontainers).
 
 ```
-gradle wrapper
 ./gradlew build
 ```
+
+On macOS with Docker Desktop, if Testcontainers fails to start its Ryuk container with a
+`docker.sock` mount error, set `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE=/var/run/docker.sock`.

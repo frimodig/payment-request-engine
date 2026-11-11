@@ -16,4 +16,4 @@ Core loop only, no HTTP:
 - Kotlin, JDK 21, Gradle Kotlin DSL. Plain JDBC + Flyway unless there is a reason to add a framework.
 - Amounts are `Long` minor units plus currency. No floating point.
 - No credentials, personal data or real partner data in code, tests or logs.
-- Dependency versions in `build.gradle.kts` were set without network access: verify and update them first.
+- Dependency versions in `build.gradle.kts` were verified against Maven Central on 2026-11-11.
