@@ -2,9 +2,9 @@
 
 Read `docs/architecture.md` and `docs/database.md` before changing anything. The schema in `src/main/resources/db/migration` is the source of truth for the data model; change it through new migrations only.
 
-## Intended PoC scope (not yet built)
+## PoC scope (core loop built)
 
-Core loop only, no HTTP:
+Core loop only, no HTTP. Built on `poc/slice-0-setup`; see `docs/poc-limits.md` for what is left out:
 
 1. Explicit state machine (pure; transitions return valid/invalid with side effects as data).
 2. Worker loop: claim due rows with `FOR UPDATE SKIP LOCKED`, lease + fenced write, one transaction per state change (payment_request + payment_event + outbox).
