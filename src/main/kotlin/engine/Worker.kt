@@ -40,9 +40,14 @@ class Worker(
      */
     fun runOnce(): Boolean {
         var p = store.claim(config.workerId) ?: return false
-        // Claimed for an input, not for its due time: a takeover may not know the reference the downstream gave
-        // the previous holder. Learn it before acting. (When due, the timed step does this.)
-        if (!isDue(p)) p = learnReference(p, restartWindow = false)
+        if (isDue(p) && p.state == State.SENDING) {
+            // An overdue send is checked against the downstream before any input is applied: a takeover may not know
+            // the reference the previous holder was given, and a cancellation must not be applied blind to it.
+            p = timedStep(p)
+        } else if (!isDue(p)) {
+            // Claimed for an input, not for its due time. Learn the reference before acting; the due time stays.
+            p = learnReference(p, restartWindow = false)
+        }
         p = applyInbox(p)
         p = applyCancellations(p)
         if (isDue(p)) p = timedStep(p)
@@ -71,12 +76,7 @@ class Worker(
         State.PENDING_SCREENING -> transition(p, Advance(State.READY_TO_SEND), "SCREENING_PASSED", worker)
         State.READY_TO_SEND -> startSending(p)
         State.SENDING -> checkSending(p)
-        State.PRESENTED, State.ACCEPTED, State.CANCELLATION_REQUESTED -> {
-            // Silence is only silence if we know what to wait for: a previous holder may have been cut off before
-            // it stored the reference. Learning it restarts the window instead of timing out.
-            val learned = learnReference(p)
-            if (learned.downstreamRef != p.downstreamRef) learned else transition(p, ResponseTimeout, "RESPONSE_TIMEOUT", worker)
-        }
+        State.PRESENTED, State.ACCEPTED, State.CANCELLATION_REQUESTED -> checkWaiting(p)
         // Terminal and waiting-on-a-person states have no due time, so they are never due here.
         else -> p
     }
@@ -100,7 +100,7 @@ class Worker(
             // downstream has the payment we learn its reference and keep waiting; otherwise UNKNOWN, which queues
             // reconciliation. Only the exception class is kept: its message could carry data from the downstream.
             val payload = """{"error":${jsonString(e.javaClass.simpleName)}}"""
-            return when (val known = downstream.status(p.idempotencyKey)) {
+            return when (val known = statusOf(p)) {
                 is StatusResult.Known -> recordReference(p, known.downstreamRef, "SEND_TIMEOUT_RECOVERED")
                 StatusResult.Unavailable -> statusUnavailable(p, "SEND_TIMEOUT", payload)
                 StatusResult.NotFound -> transition(p, ResponseTimeout, "SEND_TIMEOUT", worker, payload = payload)
@@ -117,19 +117,22 @@ class Worker(
 
     // The response window passed in SENDING, or a worker took the payment over mid-send. Ask the downstream by the
     // same idempotency key: never a blind new send.
-    private fun checkSending(p: Payment): Payment = when (val status = downstream.status(p.idempotencyKey)) {
+    private fun checkSending(p: Payment): Payment = when (val status = statusOf(p)) {
         is StatusResult.Known -> {
             val knew = p.downstreamRef != null
             var q = if (knew) p else recordReference(p, status.downstreamRef, "STATUS_QUERY")
             when {
+                q.state != p.state -> Unit // the reference was unusable and the payment already moved to UNKNOWN
                 status.status != null ->
                     q = transition(q, ProviderReported(status.status), "STATUS_QUERY", Actor("DOWNSTREAM", downstream.name))
                 knew -> q = transition(q, ResponseTimeout, "RESPONSE_TIMEOUT", worker)
             }
             q
         }
-        // The downstream never saw it: resending under the same key is safe, the key deduplicates.
-        StatusResult.NotFound -> sendAndRecord(p)
+        // The downstream never saw it: resending under the same key is safe, the key deduplicates. But a stored
+        // reference proves it accepted the payment, so a downstream that cannot find it now is for a person.
+        StatusResult.NotFound ->
+            if (p.downstreamRef == null) sendAndRecord(p) else transition(p, ResponseTimeout, "RESPONSE_TIMEOUT", worker)
         StatusResult.Unavailable -> statusUnavailable(p, "RESPONSE_TIMEOUT", null)
     }
 
@@ -152,33 +155,78 @@ class Worker(
         )
     }
 
+    private companion object {
+        const val MAX_REFERENCE = 200
+        const val UNIQUE_VIOLATION = "23505"
+    }
+
     // A downstream's reason code is stored as it came, minus what the database cannot hold (control characters such as
     // NUL) and bounded, so a strange code can never leave a payment stuck in SENDING.
     private fun cleanReasonCode(code: String): String = code.filterNot { it.isISOControl() }.take(64)
+
+    // The response window passed while waiting on the downstream. Ask it before giving up: it may have moved on
+    // without telling us (a lost webhook), or still be waiting on the debtor. Only silence leads to UNKNOWN.
+    private fun checkWaiting(p: Payment): Payment = when (val status = statusOf(p)) {
+        is StatusResult.Known -> {
+            val q = if (p.downstreamRef != null) p else recordReference(p, status.downstreamRef, "STATUS_QUERY")
+            val reported = status.status
+            when {
+                q.state != p.state -> q // the reference was unusable and the payment already moved to UNKNOWN
+                reported == null -> transition(q, ResponseTimeout, "RESPONSE_TIMEOUT", worker)
+                // A stale answer means the downstream still says what we know: alive, keep waiting.
+                else -> transition(
+                    q, ProviderReported(reported), "STATUS_QUERY", Actor("DOWNSTREAM", downstream.name), rearm = true,
+                )
+            }
+        }
+        StatusResult.NotFound -> transition(p, ResponseTimeout, "RESPONSE_TIMEOUT", worker)
+        StatusResult.Unavailable -> statusUnavailable(p, "RESPONSE_TIMEOUT", null)
+    }
+
+    // Never throws: an adapter that fails to answer is an unavailable downstream.
+    private fun statusOf(p: Payment): StatusResult =
+        try {
+            downstream.status(p.idempotencyKey)
+        } catch (e: Exception) {
+            if (e is InterruptedException) Thread.currentThread().interrupt()
+            StatusResult.Unavailable
+        }
 
     // A payment that was sent but has no stored reference: ask the downstream by the idempotency key.
     private fun learnReference(p: Payment, restartWindow: Boolean = true): Payment {
         if (p.downstreamRef != null || p.sendAttempt == 0) return p
         if (p.state != State.SENDING && p.state != State.CANCELLATION_REQUESTED) return p
-        val known = downstream.status(p.idempotencyKey) as? StatusResult.Known ?: return p
+        val known = statusOf(p) as? StatusResult.Known ?: return p
         return recordReference(p, known.downstreamRef, "STATUS_QUERY", restartWindow)
     }
 
     // Not a state change: stores the downstream reference so unsolicited events can be matched. Restarts the response
     // window, except when the payment was claimed only for an input: then it is not due, and its due time stays.
-    private fun recordReference(p: Payment, ref: String, type: String, restartWindow: Boolean = true): Payment =
-        store.apply(
-            p,
-            Change(
-                type = type,
-                actor = Actor("DOWNSTREAM", downstream.name),
-                steps = listOf(Step(p.state, p.state, Outcome.APPLIED)),
-                context = p.context,
-                nextActionAt = if (restartWindow) clock.instant().plus(config.responseWindow) else p.nextActionAt,
-                downstreamRef = ref,
-                category = "TECHNICAL",
-            ),
+    private fun recordReference(p: Payment, ref: String, type: String, restartWindow: Boolean = true): Payment {
+        if (!isUsableReference(ref)) return unusableReference(p)
+        val change = Change(
+            type = type,
+            actor = Actor("DOWNSTREAM", downstream.name),
+            steps = listOf(Step(p.state, p.state, Outcome.APPLIED)),
+            context = p.context,
+            nextActionAt = if (restartWindow) clock.instant().plus(config.responseWindow) else p.nextActionAt,
+            downstreamRef = ref,
+            category = "TECHNICAL",
         )
+        return try {
+            store.apply(p, change)
+        } catch (e: java.sql.SQLException) {
+            // One payment per downstream reference: a reference another payment already holds cannot be stored.
+            if (e.sqlState == UNIQUE_VIOLATION) unusableReference(p) else throw e
+        }
+    }
+
+    // The downstream answered, but with a reference we cannot store or that is not unique. Retrying would repeat the
+    // same answer forever, so the payment goes to a person like any other answer nobody can act on.
+    private fun unusableReference(p: Payment): Payment =
+        transition(p, ResponseTimeout, "UNUSABLE_REFERENCE", worker, payload = """{"error":"unusable downstream reference"}""")
+
+    private fun isUsableReference(ref: String) = ref.isNotBlank() && ref.length <= MAX_REFERENCE && ref.none { it.isISOControl() }
 
     private fun transition(
         p: Payment,
@@ -190,6 +238,7 @@ class Worker(
         sendAttempt: Int? = null,
         downstream: String? = null,
         payload: String? = null,
+        rearm: Boolean = false,
     ): Payment {
         val result = when (val t = PaymentStateMachine.transition(p.context, input)) {
             is Transition.Valid -> t
@@ -197,7 +246,8 @@ class Worker(
         }
         // A step that leaves the state alone (stale event, position update) must not move the due time:
         // otherwise a stream of repeated events could postpone the timeout forever.
-        val due = if (result.state == p.state) p.nextActionAt else scheduleFor(result.state, clock.instant())
+        // [rearm]: a status check that found the downstream unchanged restarts the wait instead.
+        val due = if (result.state == p.state && !rearm) p.nextActionAt else scheduleFor(result.state, clock.instant())
         return store.apply(
             p,
             Change(

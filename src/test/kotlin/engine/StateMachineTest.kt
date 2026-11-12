@@ -346,6 +346,16 @@ class StateMachineTest {
     }
 
     @Test
+    fun `a cancellation confirmation after the debtor accepted is a mismatch, with or without a timeout`() {
+        val accepted = run(CancelRequested, reported(ProviderAccepted), from = presented)
+        assertEquals(ACCEPTED, accepted.state)
+        val unknown = accepted.then(ResponseTimeout).context
+        assertEquals(UNKNOWN, unknown.state)
+        assertEquals(MISMATCH, unknown.then(reported(ProviderStatus.CANCELLED)).state)
+        assertEquals(MISMATCH, accepted.then(reported(ProviderStatus.CANCELLED)).state)
+    }
+
+    @Test
     fun `a cancellation nobody requested cannot be confirmed`() {
         assertEquals(MISMATCH, presented.then(reported(ProviderStatus.CANCELLED)).state)
         assertEquals(MISMATCH, sending.then(ResponseTimeout).context.then(reported(ProviderStatus.CANCELLED)).state)

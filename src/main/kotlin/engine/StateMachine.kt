@@ -117,7 +117,8 @@ object PaymentStateMachine {
 
         if (target == State.CANCELLED) {
             // Only a cancellation we asked for can be confirmed.
-            return if (ctx.cancelRequested && current in cancelPending) {
+            // Not after the debtor accepted: by then the payment is past the point where a cancellation can win.
+            return if (ctx.cancelRequested && current in cancelPending && position != State.ACCEPTED) {
                 applyPath(ctx, listOf(State.CANCELLED))
             } else {
                 noPath(ctx)

@@ -223,9 +223,15 @@ class ScenarioTests {
         val id = sent()
         deliver(id, ProviderStatus.PRESENTED)
         drain(worker("A"))
+        // Silence: the response window passes and the downstream does not answer the status query either.
+        downstream.statusAvailable = false
         clock.advance(window.plusSeconds(1))
-        drain(worker("A"))
+        repeat(5) {
+            drain(worker("A"))
+            clock.advance(Duration.ofSeconds(31))
+        }
         assertUnknown(id)
+        downstream.statusAvailable = true
 
         deliver(id, ProviderStatus.PAID)
         drain(worker("A"))

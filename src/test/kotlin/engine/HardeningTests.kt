@@ -213,9 +213,11 @@ class HardeningTests {
         drain(worker("A"))
         inbox.receive(downstream.event(key(id), ProviderStatus.PRESENTED))
         drain(worker("A"))
+        downstream.statusAvailable = false
         clock.advance(window.plusSeconds(1))
-        drain(worker("A"))
+        repeat(5) { drain(worker("A")); clock.advance(retryDelay.plusSeconds(1)) }
         assertEquals("UNKNOWN", tables.payment(id).state)
+        downstream.statusAvailable = true
 
         val newer = submit("E2")
         inbox.receive(downstream.event(key(id), ProviderStatus.PAID))
@@ -325,6 +327,108 @@ class HardeningTests {
             InstructionResult.Conflict(second.paymentId),
             ingestion.submit("P1", "M4", listOf(Instruction("E2", "1.00", "EUR", debtorReference = ""))).single(),
         )
+    }
+
+    @Test
+    fun `no blind resend when the downstream has lost a payment it once accepted`() {
+        val id = submit("E1")
+        drain(worker("A"))
+        assertEquals("REF-1", tables.payment(id).downstreamRef)
+        downstream.forget(key(id))
+        clock.advance(window.plusSeconds(1))
+        drain(worker("A"))
+        assertEquals("UNKNOWN", tables.payment(id).state, "an accepted payment the downstream cannot find is for a person")
+        assertEquals(1, downstream.sendCallCount)
+        assertEquals("REF-1", tables.payment(id).downstreamRef, "the first reference is never replaced")
+    }
+
+    @Test
+    fun `a reference the database cannot store, or that is already taken, ends in UNKNOWN instead of retrying forever`() {
+        downstream.script(SendBehavior.AcceptWithRef("A\u0000B"))
+        val odd = submit("E1")
+        drain(worker("A"))
+        assertEquals("UNKNOWN", tables.payment(odd).state)
+        assertTrue(tables.events(odd).any { it.type == "UNUSABLE_REFERENCE" })
+        assertTrue(tables.outbox(odd).any { it.first == "RECONCILIATION" })
+
+        downstream.script(SendBehavior.AcceptWithRef("DUP"), SendBehavior.AcceptWithRef("DUP"))
+        val a = submit("E2")
+        val b = submit("E3")
+        drain(worker("A"))
+        assertEquals(setOf("SENDING", "UNKNOWN"), setOf(tables.payment(a).state, tables.payment(b).state))
+    }
+
+    @Test
+    fun `a status call that throws is treated as unavailable, then UNKNOWN`() {
+        downstream.statusThrows = true
+        downstream.script(SendBehavior.TimeoutAfterProcessing)
+        val id = submit("E1")
+        drain(worker("A"))
+        assertEquals("SENDING", tables.payment(id).state)
+        assertTrue(tables.events(id).any { it.type == "STATUS_UNAVAILABLE" })
+        repeat(5) { clock.advance(retryDelay.plusSeconds(1)); drain(worker("A")) }
+        assertEquals("UNKNOWN", tables.payment(id).state)
+    }
+
+    @Test
+    fun `a takeover that is overdue checks the downstream before it applies a cancellation`() {
+        val id = submit("E1")
+        val reached = CountDownLatch(1)
+        val resume = CountDownLatch(1)
+        val stalled = worker("A") { reached.countDown(); resume.await(30, TimeUnit.SECONDS) }
+        val pool = Executors.newSingleThreadExecutor()
+        try {
+            val a = pool.submit { drain(stalled) }
+            assertTrue(reached.await(30, TimeUnit.SECONDS))
+            // The downstream received the request that worker A made, then A died before recording the answer.
+            downstream.send(SendRequest(key(id), id, Money(1234, "EUR"), "E1"))
+            clock.advance(window.plusMinutes(1)) // past both the lease and the response window
+            tables.requestCancellation(id)
+            assertTrue(worker("B").runOnce())
+            assertEquals("REF-1", tables.payment(id).downstreamRef, "the overdue check ran first and learned the reference")
+            assertEquals("CANCELLATION_REQUESTED", tables.payment(id).state)
+            resume.countDown()
+            assertFailsWith<ExecutionException> { a.get(30, TimeUnit.SECONDS) }
+        } finally {
+            resume.countDown()
+            pool.shutdownNow()
+        }
+    }
+
+    /** A payment that reached ACCEPTED with the downstream's PAID webhook lost. */
+    private fun acceptedWithLostPaid(): UUID {
+        val id = submit("E1")
+        drain(worker("A"))
+        inbox.receive(downstream.event(key(id), ProviderStatus.PRESENTED))
+        drain(worker("A"))
+        inbox.receive(downstream.event(key(id), ProviderStatus.ACCEPTED))
+        drain(worker("A"))
+        assertEquals("ACCEPTED", tables.payment(id).state)
+        downstream.event(key(id), ProviderStatus.PAID) // the downstream moved on; the webhook never arrives
+        return id
+    }
+
+    @Test
+    fun `when the response window passes the downstream is asked, and a lost PAID webhook is recovered`() {
+        val id = acceptedWithLostPaid()
+        clock.advance(window.plusSeconds(1))
+        drain(worker("A"))
+        assertEquals("PAID", tables.payment(id).state)
+        assertTrue(tables.outbox(id).none { it.first == "RECONCILIATION" })
+    }
+
+    @Test
+    fun `a downstream that still reports the same status keeps the payment waiting, not UNKNOWN`() {
+        val id = submit("E1")
+        drain(worker("A"))
+        inbox.receive(downstream.event(key(id), ProviderStatus.PRESENTED))
+        drain(worker("A"))
+        repeat(3) {
+            clock.advance(window.plusSeconds(1))
+            drain(worker("A"))
+            assertEquals("PRESENTED", tables.payment(id).state)
+            assertTrue(tables.payment(id).nextActionAt!!.isAfter(clock.instant()), "the window was re-armed")
+        }
     }
 
     @Test

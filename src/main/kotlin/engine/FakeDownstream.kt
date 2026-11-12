@@ -16,6 +16,9 @@ sealed interface SendBehavior {
     data object TimeoutBeforeProcessing : SendBehavior
 
     data class Reject(val reasonCode: String) : SendBehavior
+
+    /** Accepts the payment but answers with this reference, however odd it is. */
+    data class AcceptWithRef(val ref: String) : SendBehavior
 }
 
 class DownstreamTimeout(message: String) : RuntimeException(message)
@@ -34,6 +37,9 @@ class FakeDownstream(override val name: String = "fake") : Downstream {
     private var nextEvent = 1
 
     @Volatile var statusAvailable = true
+
+    /** Makes [status] throw instead of answering, like a broken network adapter. */
+    @Volatile var statusThrows = false
 
     private val sendCalls = java.util.concurrent.atomic.AtomicInteger()
 
@@ -58,14 +64,24 @@ class FakeDownstream(override val name: String = "fake") : Downstream {
             SendBehavior.TimeoutBeforeProcessing -> throw DownstreamTimeout("no response")
             is SendBehavior.Delay -> Thread.sleep(behavior.millis)
             is SendBehavior.Reject -> return SendResult.Rejected(behavior.reasonCode)
-            SendBehavior.Normal, SendBehavior.TimeoutAfterProcessing -> Unit
+            SendBehavior.Normal, SendBehavior.TimeoutAfterProcessing, is SendBehavior.AcceptWithRef -> Unit
         }
-        val ref = synchronized(lock) { records.getOrPut(request.idempotencyKey) { Record("REF-${nextRef++}", request, null) }.ref }
+        val ref = synchronized(lock) {
+            records.getOrPut(request.idempotencyKey) {
+                Record((behavior as? SendBehavior.AcceptWithRef)?.ref ?: "REF-${nextRef++}", request, null)
+            }.ref
+        }
         if (behavior == SendBehavior.TimeoutAfterProcessing) throw DownstreamTimeout("response lost")
         return SendResult.Accepted(ref)
     }
 
+    /** The downstream loses its record of a key, like one whose idempotency window has passed. */
+    fun forget(idempotencyKey: String) {
+        synchronized(lock) { records.remove(idempotencyKey) }
+    }
+
     override fun status(idempotencyKey: String): StatusResult {
+        if (statusThrows) throw DownstreamTimeout("status call failed")
         if (!statusAvailable) return StatusResult.Unavailable
         val record = synchronized(lock) { records[idempotencyKey] } ?: return StatusResult.NotFound
         return StatusResult.Known(record.ref, record.status)
