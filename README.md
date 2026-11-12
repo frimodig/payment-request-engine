@@ -15,7 +15,15 @@ Architecture proposal and proof-of-concept skeleton for an engine that receives 
 
 ## Status
 
-Design proposal plus a bare skeleton. The PoC is not implemented yet; see [CLAUDE.md](CLAUDE.md) for the intended scope.
+Design proposal plus a working PoC of the core loop, no HTTP:
+
+- `State.kt`, `StateMachine.kt`: the pure state machine. Transitions return valid or invalid, side effects as data.
+- `Ingestion.kt`: submissions become deduplicated instructions (partner + end-to-end id).
+- `Store.kt`, `Worker.kt`: claim with `FOR UPDATE SKIP LOCKED`, lease, fenced write, one transaction per state change.
+- `Downstream.kt`, `FakeDownstream.kt`: the downstream boundary and a fake that can delay, time out, reject, duplicate and reorder.
+- `src/test`: unit tests, and scenario tests against a real Postgres (`ScenarioTests`).
+
+Known PoC gaps are listed in [docs/poc-limits.md](docs/poc-limits.md).
 
 ## Build
 
