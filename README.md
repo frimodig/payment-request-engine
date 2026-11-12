@@ -7,11 +7,12 @@ Architecture proposal and proof-of-concept skeleton for an engine that receives 
 
 ## Contents
 
-- [docs/architecture.md](docs/architecture.md): the proposal, open questions, decisions and trade-offs.
-- [docs/database.md](docs/database.md): tables, keys and the rules they enforce.
+- [docs/architecture.md](docs/architecture.md): the proposal as the PoC refined it, open questions, decisions and trade-offs.
+- [docs/database.md](docs/database.md): the database structure: tables, columns, indexes and the rules they enforce.
+- [docs/poc-limits.md](docs/poc-limits.md): what the PoC leaves out or gets wrong.
 - [docs/architecture.png](docs/architecture.png): one-page diagram.
 - `src/main/resources/db/migration`: the schema as a Flyway migration.
-- `src/main/kotlin`: skeleton only.
+- `src/main/kotlin`: the PoC core loop.
 
 ## Status
 
