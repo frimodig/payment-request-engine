@@ -39,6 +39,26 @@ The proof of concept built the core loop (CLAUDE.md lists its scope) to check th
 Measured by the final review, not fixed:
 
 - **The claim query scans `payment_request` on every poll.** The `OR`/`EXISTS` form and the `ORDER BY` cannot use the partial due index, and the input check is evaluated twice per candidate. About 250 to 300 ms per claim at 50k rows on default Postgres 16, against about 0.5 ms for a rewrite that finds timer-due rows and rows with inputs separately. Rewrite it before measuring throughput.
+
+  The rewrite picks the payment in two steps inside the same `UPDATE`: first one with an unapplied input, found by joining the two input tables to `payment_request`, and only if there is none, one that is timer-due, which can use the partial due index. Both selections use `FOR UPDATE ... SKIP LOCKED` and `LIMIT 1`:
+
+  ```sql
+  WHERE p.id = COALESCE(
+      (SELECT q.id FROM payment_request q
+        WHERE (q.lease_until IS NULL OR q.lease_until <= :now)
+          AND q.id IN (SELECT payment_id FROM provider_inbox WHERE status = 'NEW'
+                       UNION ALL
+                       SELECT payment_id FROM cancellation_request WHERE applied_at IS NULL)
+        ORDER BY q.next_action_at, q.created_at
+        LIMIT 1 FOR UPDATE OF q SKIP LOCKED),
+      (SELECT q.id FROM payment_request q
+        WHERE (q.lease_until IS NULL OR q.lease_until <= :now)
+          AND q.next_action_at <= :now
+        ORDER BY q.next_action_at, q.created_at
+        LIMIT 1 FOR UPDATE SKIP LOCKED))
+  ```
+
+  Measure it against the current query on realistic data before adopting it.
 - **`Db` opens a new connection for every transaction (no pool),** and one `runOnce` makes several, plus about 20 small transactions per payment before the send. Use a pooled `DataSource` and fewer round trips (the claim already knows whether an input exists).
 
 ## Test and code hygiene
