@@ -28,6 +28,7 @@ The unit of processing. One row per instruction.
 - **Lease and fencing.** `lease_owner` and `lease_until` record the current claim. `lease_token` increments on every claim. The result is a compare-and-set: `WHERE id = ? AND lease_token = ? AND event_seq = ?`. A slow worker cannot overwrite a takeover, and nothing else can have written in between.
 - **Event sequence.** `event_seq` is the last sequence number written to `payment_event` for this payment. The fenced update increments it by the number of events being written (more than one when a transition records inferred states) and returns the new value; every `payment_event` insert takes its `seq` from that value in the same transaction. That keeps the sequence gap-free and ordered, which the partitioned event table cannot enforce on its own.
 - **Downstream.** `downstream`, `downstream_ref` and `send_attempt` are stored when the request is sent, before any response, so unsolicited events can be matched and a takeover mid-send knows which attempt was in flight. The downstream idempotency key is derived from payment id and attempt.
+- **Downstream position and cancellation** (added in V2). `downstream_position` is the last known downstream state (`SENDING`, `PRESENTED` or `ACCEPTED`), null until the payment was sent. It survives `UNKNOWN` and `CANCELLATION_REQUESTED`, which would otherwise forget how far the payment got: a late event is stale or applied relative to it, never relative to a guess. `cancel_requested` is set when a partner cancellation was applied; only then can a downstream cancellation confirmation be accepted. The state machine reads and returns both with the state.
 - **Plans.** `parent_ref` is an optional reference for whoever owns a payment plan. The engine does not interpret it.
 - **State values** are not constrained in the schema while the state list is a draft.
 
@@ -60,6 +61,7 @@ Every side effect of a state change is written here in the same transaction as t
 
 - A row belongs either to one payment or to a whole submission (a file-level status report, an all-or-nothing rejection), never both.
 - Payment rows: `unique (payment_id, event_seq, kind)`, keyed on the event sequence, never on state, so a legitimate repeat of a state is not suppressed.
+- `kind` is the effect type the state machine returned: `PARTNER_STATUS` (the only delivery to a partner, and only for partner-visible states), plus the internal `FORWARD_CANCELLATION`, `RECONCILIATION` and `ALERT`. Writing the internal ones here keeps them atomic with the state change: a worker that dies after committing cannot lose them. The PoC writes all kinds but dispatches none.
 - Delivery uses its own due time (`next_attempt_at`) and attempt count, and is re-drivable from this table alone.
 
 ## manual_action

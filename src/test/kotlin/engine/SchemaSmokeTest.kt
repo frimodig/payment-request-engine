@@ -8,14 +8,14 @@ import kotlin.test.assertEquals
 
 class SchemaSmokeTest {
     @Test
-    fun `V1 migration applies to a real Postgres`() {
+    fun `all migrations apply to a real Postgres`() {
         PostgreSQLContainer("postgres:16-alpine").use { pg ->
             pg.start()
             val result = Flyway.configure()
                 .dataSource(pg.jdbcUrl, pg.username, pg.password)
                 .load()
                 .migrate()
-            assertEquals(1, result.migrationsExecuted)
+            assertEquals(2, result.migrationsExecuted)
 
             DriverManager.getConnection(pg.jdbcUrl, pg.username, pg.password).use { c ->
                 c.createStatement().executeQuery(
