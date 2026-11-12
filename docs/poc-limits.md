@@ -1,6 +1,6 @@
-# PoC limits
+# What the proof of concept does not cover
 
-What the PoC deliberately leaves out or gets wrong, so nobody mistakes it for production behaviour. The scope is the core loop in [CLAUDE.md](../CLAUDE.md). The design it proved is in [architecture.md](architecture.md).
+The proof of concept built the core loop (CLAUDE.md lists its scope) to check the design recommended in [architecture.md](architecture.md). This page lists what it deliberately leaves out and the gaps found by reviewing it, so nobody mistakes it for production behaviour or for the recommendation itself.
 
 ## Not built
 
@@ -47,7 +47,3 @@ Measured by the final review, not fixed:
 - `FakeDownstream` does not record a scripted reject, so it is not idempotent for rejections.
 - No deterministic test covers the live-lease predicate in `Store.claim`; only the concurrent test would catch it, and only when the race occurs. `HardeningTests` uses a short sleep to hold a transaction open.
 - `.gitignore` ignores `/bin/` only; nested `bin/` directories of a future module would show as untracked.
-
-## Decisions taken while building
-
-The state machine takes and returns a `Context` (`state`, last known downstream position, cancellation requested), which is why V2 adds two columns. See [architecture.md](architecture.md) for the design as it now stands.

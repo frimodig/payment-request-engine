@@ -1,6 +1,6 @@
 # Database
 
-PostgreSQL, single primary with a synchronous standby. The schema is two Flyway migrations: [V1__initial_schema.sql](../src/main/resources/db/migration/V1__initial_schema.sql) (the tables) and [V2__downstream_position_and_cancellation.sql](../src/main/resources/db/migration/V2__downstream_position_and_cancellation.sql) (two columns the state machine turned out to need). The migrations are the source of truth for the structure; this page explains it and the rules it enforces. Change the schema through new migrations only.
+The recommended data model: PostgreSQL, single primary with a synchronous standby. It is two Flyway migrations: [V1__initial_schema.sql](../src/main/resources/db/migration/V1__initial_schema.sql) (the tables) and [V2__downstream_position_and_cancellation.sql](../src/main/resources/db/migration/V2__downstream_position_and_cancellation.sql) (two columns the state machine needs). The migrations are the source of truth for the structure; this page explains it and the rules it enforces. Change the schema through new migrations only. The design behind it is in [architecture.md](architecture.md).
 
 ## Structure at a glance
 
@@ -59,7 +59,7 @@ manual_action                   └─► input marked applied
 | `paused` | boolean | Runtime pause, default false |
 | `created_at` | timestamptz | |
 
-The PoC stores these but does not read `acceptance_mode`, `max_in_flight` or `paused`.
+The proof of concept stores these but its core loop does not read `acceptance_mode`, `max_in_flight` or `paused`.
 
 ### submission
 
@@ -88,7 +88,7 @@ The PoC stores these but does not read `acceptance_mode`, `max_in_flight` or `pa
 | `amount_minor` | bigint | > 0, minor units |
 | `currency` | char(3) | `[A-Z]{3}` |
 | `amount_modification_allowed` | boolean | default false |
-| `expires_at` | timestamptz | Internal expiry; not used by the PoC |
+| `expires_at` | timestamptz | Internal expiry; not exercised by the proof of concept |
 | `debtor_identification`, `creditor_identification`, `remittance_reference` | text | Personal data |
 | `downstream` | text | Which downstream the payment was sent to |
 | `downstream_ref` | text | The downstream's reference for it; unique per `downstream` |
@@ -191,7 +191,7 @@ The unit of processing. One row per instruction.
 
 ### State values
 
-The `state` column is not constrained in the schema while the state list is a draft. The values in use are the PoC's `State` enum:
+The `state` column is not constrained in the schema while the state list is a draft. The recommended values are:
 
 | Group | States |
 |---|---|
@@ -206,15 +206,15 @@ Append-only. The application role has `INSERT` and `SELECT` only; no `UPDATE` or
 
 - One row per lifecycle event: `type`, `from_state`, `to_state`. A transition that infers skipped states writes one row per step.
 - `outcome`: `APPLIED`, `INFERRED` (a skipped state on a valid path), `STALE` (recorded, not applied) or `NO_PATH` (contradicts the current state; the payment moves to `MISMATCH`).
-- `category`: `BUSINESS` or `TECHNICAL`, so retries do not bury the events an auditor needs. The PoC writes `TECHNICAL` for `STALE` steps and for bookkeeping that changes no state (storing a reference, an unavailable status answer).
+- `category`: `BUSINESS` or `TECHNICAL`, so retries do not bury the events an auditor needs. `STALE` steps and bookkeeping that changes no state (storing a reference, an unavailable status answer) are `TECHNICAL`.
 - `actor_type` and `actor_id`: partner, internal service, downstream, or admin user.
 - `reason` and `manual_action_id` are required for `ADMIN` events (check constraint). That the linked action is approved is enforced by the application, not the schema.
-- `occurred_at` (when it happened, per the source) and `recorded_at` (when we wrote it) are meant to differ for late downstream events. The PoC sets both to the time the worker applied the step.
+- `occurred_at` (when it happened, per the source) and `recorded_at` (when we wrote it) are meant to differ for late downstream events. The proof of concept sets both to the time the worker applied the step; keep the source time from day one.
 - `correlation_id` traces one file or API call across all its payments. `inbox_event_id` links to the raw provider event.
 - `payload` holds mapped reason codes and downstream references, never personal data. The raw provider message stays in `provider_inbox`, linked by `inbox_event_id`.
 - Partitioned by `recorded_at`, monthly. The migration creates 2026-11 to 2027-01; a scheduled job creates partitions ahead of time. The default partition is a safety net that should stay empty: a row there is an alert, because it blocks creating the partition for that range. Old partitions are detached and archived, subject to the retention policy.
 
-### Event types the PoC writes
+### Event types
 
 | Type | When |
 |---|---|
@@ -232,10 +232,10 @@ Append-only. The application role has `INSERT` and `SELECT` only; no `UPDATE` or
 
 ## provider_inbox
 
-Downstream events, stored and acknowledged before any processing. The PoC stores the status of each event in `payload` (`{"status": ...}`), not the raw message.
+Downstream events, stored and acknowledged before any processing. The raw message belongs in `payload`; the proof of concept stores only the status (`{"status": ...}`).
 
 - `unique (provider, provider_event_id)` drops duplicate deliveries before they reach the state machine.
-- `provider_timestamp` is a hint, never the deciding vote; the state graph decides. The PoC sets it to the receive time.
+- `provider_timestamp` is a hint, never the deciding vote; the state graph decides. The proof of concept sets it to the receive time.
 - `status`: `NEW`, `APPLIED`, `PARKED` (no matching payment yet). Parked events are never acknowledged-and-dropped.
 - Matching: on arrival the writer extracts `downstream_ref` and resolves `payment_id` by `(downstream, downstream_ref)`, where `provider` uses the same values as `payment_request.downstream`. Matched rows are inserted `NEW`, unmatched rows `PARKED` (check constraint: parked if and only if unlinked). The transaction that records a payment's `downstream_ref` re-links any parked rows for it and sets them `NEW`.
 - A per-reference Postgres advisory lock (`pg_advisory_xact_lock` on provider and reference), held until commit, serialises receiving an event with storing the reference. Without it an event can be inserted `PARKED` at the moment the reference commits, and nobody links the two.
@@ -246,12 +246,12 @@ Every side effect of a state change is written here in the same transaction as t
 
 - A row belongs either to one payment or to a whole submission (a file-level status report, an all-or-nothing rejection), never both.
 - Payment rows: `unique (payment_id, event_seq, kind)`, keyed on the event sequence, never on state, so a legitimate repeat of a state is not suppressed.
-- `kind` is the effect type the state machine returned: `PARTNER_STATUS` (the only delivery to a partner, and only for partner-visible states), plus the internal `FORWARD_CANCELLATION`, `RECONCILIATION` and `ALERT`. Writing the internal ones here keeps them atomic with the state change: a worker that dies after committing cannot lose them. A dispatcher must deliver only `PARTNER_STATUS` to partners. The PoC writes all kinds but dispatches none.
+- `kind` is the effect type the state machine returned: `PARTNER_STATUS` (the only delivery to a partner, and only for partner-visible states), plus the internal `FORWARD_CANCELLATION`, `RECONCILIATION` and `ALERT`. Writing the internal ones here keeps them atomic with the state change: a worker that dies after committing cannot lose them. A dispatcher must deliver only `PARTNER_STATUS` to partners. The proof of concept writes all kinds but dispatches none.
 - Delivery uses its own due time (`next_attempt_at`) and attempt count, and is re-drivable from this table alone.
 
 ## manual_action
 
-Maker-checker. `requested_by` and `approved_by` must differ, a decided action always records who decided and when, and only an approved action can be marked applied (check constraints). The worker applies it under a lease, through the state machine like any other input, and sets `applied_at` in the same transaction. Not used by the PoC.
+Maker-checker. `requested_by` and `approved_by` must differ, a decided action always records who decided and when, and only an approved action can be marked applied (check constraints). The worker applies it under a lease, through the state machine like any other input, and sets `applied_at` in the same transaction. Not exercised by the proof of concept.
 
 ## cancellation_request
 
