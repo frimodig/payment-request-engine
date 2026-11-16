@@ -2,6 +2,27 @@
 
 The proof of concept was reviewed four times (three rounds at high effort, then a final round at max effort with ten finder angles and independent verifiers). This page records what was found and what became of each finding. Everything marked "fixed" has a test that fails without the fix. Everything marked "documented" is listed in [poc-limits.md](poc-limits.md).
 
+## Adversarial review of the plan
+
+After the code reviews, two independent challengers reviewed the recommendation itself. One asked whether it is the right thing to build; the other asked whether the proof of concept proves its technical claims. The brief is deliberately general, so findings that asked to pin down the product, scheme or downstreams were answered by keeping the design general rather than by narrowing it.
+
+| Finding | Outcome |
+|---|---|
+| Every payment caught in a downstream outage of about 90 seconds or more went to `UNKNOWN` for a person | Fixed: backoff up to an outage horizon ([architecture.md](architecture.md#downstream-outages)); tested with a 30-minute outage |
+| A send that failed while the downstream answered "not found" went straight to `UNKNOWN` | Fixed: resent later under the same key |
+| `PAID` was final, so money coming back after it had no place, and partial payment was undefined | Fixed: `PAID` waits for `SETTLED`, which reconciliation confirms for the full amount; a different outcome after `PAID` is a `MISMATCH` |
+| The docs said files are ingested in bounded transactions; the PoC uses one transaction per submission | Corrected: staged, chunked ingestion is the recommendation, and the gap is listed |
+| Resend safety rests on downstream key semantics nobody has checked: retention, what a repeated key returns, format (our key is 38 characters, ISO ids 35) | Documented as adapter requirements and a risk |
+| "The four downstream styles differ only inside the adapter" was untested | Reworded: only the synchronous style was built |
+| No timeouts on calls, leases on each instance's clock | Documented; the recommendation now requires both |
+| One large file delays API traffic | Documented; the recommendation adds a claim lane for interactive work |
+| Sanctions screening could be set to fail open | Changed: always fails closed |
+| Keeping files as the audit record contradicted deleting them on erasure | Resolved: kept for the legal period, erasure requests restrict use ([architecture.md](architecture.md#retention-and-erasure)) |
+| No threat model | Added: [threat-model.md](threat-model.md) |
+| End-to-end ids reused by a partner are rejected forever | Kept as a published rule: every instruction needs a new id, and the key outlives archiving |
+| The claim-query figures cannot be reproduced from the repository | Labelled as a one-off measurement |
+| Product, scheme, build-or-buy, volumes, ownership and the Postgres-versus-workflow-engine choice | Left open on purpose for the exercise; volumes and downstream key semantics are listed as risks |
+
 ## Final review (max effort)
 
 | # | Finding | Outcome |

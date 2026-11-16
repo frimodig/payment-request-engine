@@ -90,9 +90,9 @@ The key sent to the downstream is `paymentId:sendAttempt`. It is derived from th
 | Knows it | any | Store the reference; apply any reported state |
 | Does not know it | no | It never arrived: resend under the same key |
 | Does not know it | yes | It accepted it once and lost it: `UNKNOWN`, never a resend |
-| No answer, or its adapter fails | any | Retry the query a few times, then `UNKNOWN` |
+| No answer, or its adapter fails | any | An outage: back off and retry, `UNKNOWN` only after the outage horizon |
 
-- *Where:* `Worker.checkSending`, `Worker.statusUnavailable`, `Worker.sendAndRecord`.
+- *Where:* `Worker.checkSending`, `Worker.unreachable`, `Worker.sendAndRecord`.
 - *Proof:* "a worker that dies after recording SENDING is taken over and resends under the same key", "a worker that died after the downstream accepted is taken over without a second send", "no blind resend when the downstream has lost a payment it once accepted".
 
 ### 3.7 Unknown never expires into failed
@@ -101,6 +101,7 @@ A timeout moves a payment to `UNKNOWN`, never to a failure state, and `UNKNOWN` 
 
 - *Why:* a failed payment may be retried or reported as failed to the partner. If it actually went through, that is a double payment or a lie.
 - *Proof:* "a timeout nobody can explain is UNKNOWN, queued for reconciliation, and never turns into failed", "when the response window passes the downstream is asked, and a lost PAID webhook is recovered".
+- *Outages are different:* a downstream that does not answer is down, not unknown. The worker backs off (30 seconds, doubling to 10 minutes) and only moves the payment to `UNKNOWN` once the outage outlasts the horizon. Proof: `OutageTests`.
 
 ### 3.8 The provider inbox: store first, apply later
 
@@ -162,7 +163,7 @@ Three layers. The door deduplicates on (partner, end-to-end id). Only the lease 
 
 <details><summary>A call to the downstream times out. What happens?</summary>
 
-The outcome is unknown, so the worker asks the downstream by the idempotency key. If it knows the payment, the reference is stored and the payment keeps waiting. If it does not, and we hold no reference, it never arrived and the same key is sent again. If the status call is unavailable, it is retried a few times, then the payment becomes `UNKNOWN` and a reconciliation effect is queued. It never becomes a failure.
+The outcome is unknown, so the worker asks the downstream by the idempotency key. If it knows the payment, the reference is stored and the payment keeps waiting. If it does not, and we hold no reference, it never arrived and the same key is sent again. If the status call is unavailable, it is retried with backoff until the outage horizon, then the payment becomes `UNKNOWN` and a reconciliation effect is queued. It never becomes a failure.
 </details>
 
 <details><summary>What is the difference between UNKNOWN and MISMATCH?</summary>
@@ -226,6 +227,8 @@ First the blocking step 0: canonical model, transition table, event schema, stat
 | Inferred | A state skipped by an event, recorded as passed through |
 | `UNKNOWN` | We lost track of the outcome; waits on a person or a late event |
 | `MISMATCH` | The downstream contradicts our state; frozen and alerted |
+| `PAID` / `SETTLED` | The downstream reports the payment made / reconciliation confirms the money in the partner's account. Only `SETTLED` is final |
+| Outage horizon | How long a downstream may stay unreachable before its payments go to a person |
 | Reconciliation | Comparing what we believe with account statements (camt.053/054) |
 | Request to Pay | pain.013: the creditor asks the debtor to pay; the payment is a separate step |
 
@@ -238,3 +241,4 @@ First the blocking step 0: canonical model, transition table, event schema, stat
 | What the proof of concept leaves out | [poc-limits.md](poc-limits.md) |
 | Why each choice was made, in order | [poc-decisions.md](poc-decisions.md) |
 | What the reviews found and what became of it | [review-findings.md](review-findings.md) |
+| Threats and their controls | [threat-model.md](threat-model.md) |

@@ -20,12 +20,15 @@ A financial institution needs an engine that receives payment instructions from 
 | Tracks the lifecycle of every instruction | [Processing model](#processing-model), [State machine](#state-machine), [database.md](database.md) |
 | Downstream systems of any style | [Downstream systems](#downstream-systems) |
 
+The brief leaves payment types, schemes and downstream systems open on purpose, so this is a general engine. A scheme's own lifecycle and status codes are mapped onto the internal ones inside its adapter. Request to Pay is the worked example throughout because pain.013 is one.
+
 ## Recommendation in brief
 
 - **One core, two front doors.** Every submission becomes individual instructions processed by one pipeline. Files and the API are two ingestion adapters into the same core, so Phase 2 adds a door rather than a second engine.
 - **One modular service, N identical instances, one PostgreSQL.** Every state with automatic work has a due time. A worker claims what is due or has a new input, under a lease with fenced writes. No queue broker, no per-state services.
 - **An explicit, pure state machine.** Out-of-order downstream events are resolved by the state graph, never by clocks. Unknown outcomes are a state with an owner; a timeout never becomes a failure.
-- **Everything the engine does is an event, and every effect is an outbox row,** written in the same transaction as the state change. Nothing is lost if a worker dies, and every status can be explained.
+- **A downstream outage is not an unknown outcome.** The worker backs off and retries on its own; only an outage longer than a set horizon hands payments to a person.
+- **Everything the engine does is an event, and every other effect is an outbox row,** written in the same transaction as the state change. The downstream call itself is guarded by recording `SENDING` before it is made. Nothing is lost if a worker dies, and every status can be explained.
 - **Downstreams hide behind adapters.** One adapter per downstream, one internal vocabulary, our own idempotency key on every call.
 - **Build the failure paths first.** Duplicates, reordering, timeouts and takeovers decide whether this engine is trustworthy; the happy path is the easy part.
 
@@ -38,7 +41,7 @@ The design changes less with the answers than the front doors do, but these deci
 3. **Files.** Do partners already export these files? Is there an existing host-to-host channel to reuse?
 4. **Constraints.** Which currencies, downstream systems and SLAs are in scope?
 
-pain.013 is a Creditor Payment Activation Request (Request to Pay). The status goes back as pain.014, and an accepted request is followed by a separate credit transfer, possibly several or a partial one. The final status waits on the debtor, so status is asynchronous in both phases: Phase 2 removes batching, not asynchrony.
+pain.013 is a Creditor Payment Activation Request (Request to Pay). The status goes back as pain.014, and an accepted request is followed by a separate credit transfer, possibly several or a partial one. The final status waits on the debtor and on settlement, so status is asynchronous in both phases: Phase 2 removes batching, not asynchrony.
 
 ## One core, two front doors
 
@@ -56,6 +59,7 @@ A file is a bulk API call with the same idempotency rules:
 
 - Deduplicate per instruction (partner + end-to-end id). A corrected resend gets a new message id; already-accepted rows are no-ops.
 - Same id with different content is a conflict, rejected explicitly. Never a silent edit.
+- End-to-end ids are unique per partner for good, and this is a published rule: every new instruction needs a new id. The deduplication key outlives archiving, so an old id never becomes free again.
 - Control totals validate the file as received; the report gives accepted and rejected counts against them.
 - Per-partner setting: partial acceptance (default) or all-or-nothing.
 
@@ -68,10 +72,12 @@ Payment plans and mandates. They bring due-date rules, missed payments, under- a
 The partner needs an acknowledgement and processing status. These are different things at three levels:
 
 1. **Receipt.** The API answers inside the call: accepted for processing, or a clear, non-retryable error. A file gets a file-level acknowledgement with accepted and rejected counts against its control totals, and a reason per rejected row.
-2. **Per-instruction status.** Each partner-visible state change produces a status the partner can receive. Delivery channels, all fed from the same outbox: webhooks, a status API the partner can poll, and pain.014 files for file partners. Delivery is at least once with a stable event id per status, so partners deduplicate. A partner polling gets the current state, so a missed webhook does not matter.
+2. **Per-instruction status.** Each partner-visible state change produces a status the partner can receive. Delivery channels, all fed from the same outbox: webhooks, a status API the partner can poll, and pain.014 files for file partners. Delivery is at least once with a stable event id per status, so partners deduplicate. A partner polling gets the current state, so a missed webhook does not matter. A webhook URL must be https to a fully qualified host name whose every address is public, checked at registration and before each delivery; delivery connects to the checked addresses and follows no redirects, so a partner cannot point the engine inside the bank ([threat model](threat-model.md), B3).
 3. **Final outcome.** For a Request to Pay the final status waits on the debtor and on the credit transfer that follows, so it arrives later and asynchronously, in both phases.
 
-The status vocabulary is a contract, and published values are forever. Expose only states that mean something to the partner: `PRESENTED`, `ACCEPTED`, `CANCELLATION_REQUESTED`, `PAID`, `REJECTED`, `REFUSED`, `EXPIRED`, `CANCELLED` (`RECEIVED` is acknowledged at receipt). Keep validation, screening, sending, `UNKNOWN` and `MISMATCH` internal. "Accepted" must be documented as accepted for processing, not as paid.
+The status vocabulary is a contract, and published values are forever. Expose only states that mean something to the partner: `PRESENTED`, `ACCEPTED`, `CANCELLATION_REQUESTED`, `PAID`, `SETTLED`, `REJECTED`, `REFUSED`, `EXPIRED`, `CANCELLED` (`RECEIVED` is acknowledged at receipt). Keep validation, screening, sending, `UNKNOWN` and `MISMATCH` internal. "Accepted" must be documented as accepted for processing, not as paid.
+
+Paid and settled are separate. Some payout platforms report a payment as paid once it reaches the payee's bank, and it can still be rejected and returned after that. `PAID` means the downstream reports the payment made. `SETTLED` means reconciliation against the partner's account statement confirmed the money arrived, for the full amount. Money can still come back after `PAID`, so only `SETTLED` is final. A partner that acts on `PAID` (ships goods) takes that risk knowingly.
 
 ## Internal representation
 
@@ -79,13 +85,13 @@ Parse and validate at the edge, then work on one canonical instruction. Channel 
 
 - **Canonical instruction.** Partner and message references, end-to-end id, amount as integer minor units plus ISO 4217 currency, debtor and creditor identification, remittance reference, expiry, optional parent reference, and a content hash for conflict detection.
 - **One mapping in, one per downstream out.** Ingestion adapters map the channel format to the canonical instruction; downstream adapters map it to the downstream's format and its replies back to the internal status vocabulary and reason codes.
-- **Keep the original.** The received file stays in object storage and is the audit record for what the partner sent.
+- **Keep the original.** The received file stays in write-once object storage, with its hash recorded at receipt, and is the audit record for what the partner sent. It is kept for the retention period (see [Retention and erasure](#retention-and-erasure)).
 - **Version the model and the contracts.** Unsupported message versions get a clear non-retryable error.
 
 ## Validation and business rules
 
 - **Synchronous at ingestion:** schema, required fields, duplicate ids, known partner, per-partner usage profile, amount parsed exactly (see [Money and time](#money-and-time)).
-- **Asynchronous before routing:** sanctions, AML, fraud, partner limits. Results are lifecycle states. Fail-open or fail-closed is set per check; a dependency outage parks the instruction as `PENDING_SCREENING` rather than rejecting it.
+- **Asynchronous before routing:** sanctions, AML, fraud, partner limits. Results are lifecycle states. Sanctions screening always fails closed: nothing is sent without a result. Other checks can be set to fail open or closed. A dependency outage parks the instruction as `PENDING_SCREENING` rather than rejecting it.
 - **Rules are data, not code paths.** Per-partner profiles (acceptance mode, in-flight limit, runtime pause, allowed currencies and amounts) and per-downstream routing rules live in configuration the pipeline reads, with a reason recorded for every rejection.
 - **Routing** chooses the downstream per instruction from currency, partner and capability; no FX inside the engine.
 - Partner trend signals feed the bank's existing transaction monitoring: volume and amount against baseline, share of new debtors, debtor refusal rate.
@@ -99,21 +105,34 @@ Parse and validate at the edge, then work on one canonical instruction. Channel 
 - Ingestion stores a row due now.
 - After sending, due = now + expected response window.
 - A downstream event arrives: it is stored in the provider inbox, and the worker that claims the payment applies it through the state machine. Only the lease holder ever changes a payment's state; events, cancellations and approved manual actions are inputs it picks up.
-- The event never arrives: the due time passes and the worker queries the downstream. If it reports a later state, the payment is caught up through the state machine; if it reports the same state, the payment keeps waiting for another window; if it cannot find the payment or does not answer (after a few retries), the payment moves to `UNKNOWN`.
-- Retries, backoff and request expiry are all just due times. No due time means no automatic work: terminal, or waiting on a person (`UNKNOWN`, `MISMATCH`).
+- The event never arrives: the due time passes and the worker queries the downstream. If it reports a later state, the payment is caught up through the state machine; if it reports the same state, the payment keeps waiting for another window; if it cannot find the payment, the payment moves to `UNKNOWN`. If it does not answer, that is an outage (see [Downstream outages](#downstream-outages)).
+- Retries, backoff and request expiry are all just due times. No due time means no automatic work: terminal, waiting on settlement (`PAID`), or waiting on a person (`UNKNOWN`, `MISMATCH`).
 
 Webhooks and Postgres `LISTEN/NOTIFY` only wake workers sooner. NOTIFY is best effort (lost on disconnect or failover), so the table plus polling is the guarantee; a worker polls immediately whenever it re-establishes LISTEN.
 
-**Claiming.** `SELECT ... FOR UPDATE SKIP LOCKED` in a short transaction sets a lease and increments a lease token. Work happens outside the transaction; no row lock is held across a downstream call. The result is a compare-and-set on the lease token and event sequence (fencing). Every write renews the lease, and every step has a timeout shorter than the lease, so expiry means the worker stopped, and a slow worker cannot overwrite a takeover. A worker that fails does not release its lease: it expires like a crashed worker's, which allows takeover and stops a failing payment being retried in a hot loop. Claims take payments with an unapplied input first, then the earliest due time, with per-partner and per-downstream in-flight limits for fairness.
+**Claiming.** `SELECT ... FOR UPDATE SKIP LOCKED` in a short transaction sets a lease and increments a lease token. Work happens outside the transaction; no row lock is held across a downstream call. The result is a compare-and-set on the lease token and event sequence (fencing). Every write renews the lease, and every downstream call and database statement has a timeout shorter than the lease, checked when the service starts, so expiry means the worker stopped, and a slow worker cannot overwrite a takeover. Leases and due times use the database clock, not each instance's own. A worker that fails does not release its lease: it expires like a crashed worker's, which allows takeover and stops a failing payment being retried in a hot loop. Claims take payments with an unapplied input first, then the earliest due time, with per-partner and per-downstream in-flight limits for fairness. Interactive work gets its own claim lane, so one API request is never queued behind every step of a large file.
 
 **Inputs are applied by the lease holder only.** A provider event is stored in the inbox when it arrives (deduplicated on provider and event id) and applied later by the worker that claims the payment. An event for a reference we do not know yet is parked and linked when the reference is stored; a per-reference lock makes sure an event arriving at that moment is never left parked.
 
 **Takeover mid-send never resends blindly.** `SENDING` is recorded with an attempt number before the downstream call. The idempotency key is derived from payment and attempt, never from the worker. An overdue payment in `SENDING` is checked against the downstream before anything else is applied to it, including a cancellation:
 
 - The downstream knows it: store its reference and carry on (a reported state is applied through the state machine).
-- The downstream does not know it and we hold no reference: it never arrived, so resend under the same key; the key deduplicates.
+- The downstream does not know it and we hold no reference: it never arrived, so resend under the same key; the key deduplicates. This holds only while the downstream still keeps the key, so the outage horizon must stay inside its key retention.
 - The downstream does not know it but we hold a reference: it accepted it once, so this is not a resend. The payment goes to `UNKNOWN` for reconciliation.
-- The downstream does not answer, or its adapter fails: retry the query a few times, then `UNKNOWN`. A timeout never becomes a failure.
+- The downstream does not answer, or its adapter fails: an outage. Back off and retry; `UNKNOWN` only once the outage outlasts the horizon. A timeout never becomes a failure.
+
+### Downstream outages
+
+When a downstream is down, every payment that waits on it fails its next call. Treating each failure as an unknown outcome sent every payment in the outage to a person: in the proof of concept, all 11 payments caught in a 30-minute outage ended in `UNKNOWN`. Options considered:
+
+| Option | What it does | Verdict |
+|---|---|---|
+| Back off per payment, up to a horizon | Failed sends and unanswered status queries keep the payment in its state; the wait doubles from 30 seconds to a 10-minute limit; only an outage longer than the horizon (2 hours by default) leads to `UNKNOWN`; any status answer ends an outage | Chosen and built. Removes the manual work for any outage shorter than the horizon, with no new state and no shared state |
+| Circuit breaker per downstream | Stops new sends and pauses retries while the downstream is known to be down; probes, then resumes | Next step. Saves load and failed calls, but on its own does not resolve anything |
+| `UNKNOWN` re-checks itself | `UNKNOWN` gets a long backoff and asks the downstream again before a person looks | Worth adding later as the safety net after the horizon. Changes what `UNKNOWN` means, and needs a transition back to the waiting state |
+| Bulk reconciliation after recovery | Matches a downstream report or statement against everything affected | Belongs to reconciliation; needed for downstreams that cannot answer status queries |
+
+With backoff, the same 30-minute outage needs nobody: lost webhooks are recovered by asking, sends that never arrived are resent under the same key, and each payment makes at most 8 failed calls. The horizon is per downstream and must be shorter than its idempotency key retention, because a resend after the outage relies on the key still being known. A send that failed while the downstream answers status queries with "not found" is retried the same way: the downstream says it never arrived.
 
 **Scheduled singletons** (reconciliation runs, statement matching, partition maintenance) need one runner at a time: ShedLock or db-scheduler recurring tasks.
 
@@ -130,20 +149,22 @@ Out-of-order provider events are resolved by the graph, not the clock:
 - No path: recorded with outcome `NO_PATH`, and the payment moves to `MISMATCH`, with an owner and an alert.
 - A provider event can only be applied once the payment was sent. It never skips validation, screening or the send itself.
 - `MISMATCH` and terminal states never change. A different final outcome reported after a terminal state (`PAID` after `CANCELLED`) is recorded as stale and raises an alert: money moved and a person must look.
+- A different outcome after `PAID` (a reject, a refusal, a cancellation) means money came back or never should have moved: the payment goes to `MISMATCH`. Returns become their own partner-visible status when the vocabulary is frozen.
 - A timeout leads to `UNKNOWN` only, from `SENDING`, `PRESENTED`, `ACCEPTED` and `CANCELLATION_REQUESTED`.
 
 States:
 
-- Main path: `RECEIVED → VALIDATED → PENDING_SCREENING → READY_TO_SEND → SENDING → PRESENTED → ACCEPTED → PAID`
+- Main path: `RECEIVED → VALIDATED → PENDING_SCREENING → READY_TO_SEND → SENDING → PRESENTED → ACCEPTED → PAID → SETTLED`
 - Side states: `CANCELLATION_REQUESTED`
+- Waiting on settlement: `PAID`. It has no timer: reconciliation confirms it, and an old `PAID` is an alert.
 - Waiting on a person: `UNKNOWN`, `MISMATCH`
-- Terminal: `PAID`, `REJECTED`, `REFUSED`, `EXPIRED`, `CANCELLED`
+- Terminal: `SETTLED`, `REJECTED`, `REFUSED`, `EXPIRED`, `CANCELLED`
 
 ## Downstream systems
 
 One adapter per downstream (anti-corruption layer), one internal state machine, one internal error vocabulary (ISO external status reason codes). The event records the mapped reason code and a link to the raw provider event, which stays in the provider inbox.
 
-The four styles in the brief differ only inside the adapter. All of them converge on the same two things: a send with our idempotency key, and events into the provider inbox.
+The aim is for the four styles in the brief to differ only inside the adapter, converging on the same two things: a send with our idempotency key, and events into the provider inbox. Only the synchronous style was built. A file-based downstream probably needs its own batch entity, because a file has a state, a cut-off and a whole-file reject of its own. A message-based adapter must not treat a publish acknowledgement as acceptance, or a stored reference stops meaning "the downstream has it".
 
 | Downstream style | Sending | Status and results | Watch for |
 |---|---|---|---|
@@ -153,15 +174,17 @@ The four styles in the brief differ only inside the adapter. All of them converg
 | Message-based | Publish with our key as correlation id | Replies on a queue, each is a provider event | At-least-once delivery, replies out of order, poison messages |
 
 - Capability matrix before building an adapter: sync or async, file or message, idempotency key and window, status query, error format, cut-offs, maintenance windows, rate limits, test environment, currencies, delta or absolute writes.
+- The idempotency key carries the takeover rules, so pin down its semantics with the downstream's owners and test them in its test environment: how long a key is kept (it sets the outage horizon), what a repeated key returns (it must be the original result, never a reject: a "duplicate" reject would tell the partner `REJECTED` for a payment that went through), whether status can be queried by our key, and its format. ISO 20022 identifiers are at most 35 characters, so the adapter maps our key to the downstream's format.
 - Our own idempotency key on every call. A timeout means unknown: query status if possible (rules under [Processing model](#processing-model)), otherwise `UNKNOWN` and the reconciliation queue. Unknown never expires into failed. An exception from a status call must never stop a payment: treat it as an unavailable downstream.
 - A reference the downstream gives that cannot be stored, or that another payment already holds, sends the payment to `UNKNOWN`; retrying would repeat the same answer.
 - Unsolicited events (returns, reversals, late rejects) are flows. The downstream reference is stored when it is learned; unmatched events are parked, never dropped.
-- Reconcile against account statements (camt.053/054). A mismatch is a state with an owner.
+- Reconcile against account statements (camt.053/054). Reconciliation is what confirms `SETTLED`, matching on our key, the end-to-end id or the downstream reference. A mismatch is a state with an owner.
 
 ## Money and time
 
 - Amounts as integer minor units with the currency's ISO 4217 exponent, currency carried end to end, direction explicit rather than a sign. Parse amounts as strings, never floats.
 - The requested amount is exact in its currency or rejected. Calculated amounts are rounded once, with a published rule, recorded as an event. Downstreams never round.
+- Settlement checks the amount. Less, more, or several credits for one request is a mismatch with an owner, never `SETTLED`. Events that report money carry the amount.
 - No FX inside the engine. A currency the target downstream does not support is rejected at validation.
 - Timezone-aware storage, injected clock, explicit business calendar and zone for cut-offs and expiry.
 
@@ -178,11 +201,21 @@ Undoing an executed payment is a separate refund or return flow.
 
 ## Data, availability and scale
 
-- **Volume.** A file of thousands of instructions is split into individual rows in bounded transactions, so one huge file never holds a long transaction, and processing then runs in parallel across workers. Ingestion stays available while processing is saturated.
+- **Volume.** A file of thousands of instructions is stored first, then split into individual rows in bounded chunks, so one huge file never holds a long transaction, and processing then runs in parallel across workers. The file has its own state, which is how all-or-nothing acceptance works once one transaction no longer covers the file. The proof of concept ingests a submission in one transaction. Ingestion stays available while processing is saturated.
 - Zero data loss: acknowledge only after commit replicated to a synchronous standby. If the standby is unreachable, stop acknowledging; partners resend.
 - Queueing and graceful degradation, not burst scaling.
 - Limits are the database primary and downstream capacity, not compute. Partition append-only tables by time from day one; buy disk until restore time or procurement says otherwise; archiving is a partition detach.
 - Sharding is far off. If ever: partner as the tenant key, never the downstream (unknown at ingestion, uneven, and partner queries would scatter).
+
+## Retention and erasure
+
+Payment records are financial records, so the legal obligation to keep them protects them from erasure requests, but only for the data the obligation covers and only for as long as it lasts.
+
+- **Keep for the legal period.** Payment requests, events, received files and raw provider messages are kept for the longest period that applies to them: anti-money-laundering record keeping (five years in the EU) and national bookkeeping law (often six to ten years). Compliance sets the periods per data class.
+- **During the period, an erasure request does not delete them.** The GDPR right to erasure does not apply where processing is needed to meet a legal obligation (Article 17(3)(b)). The request is recorded and answered, and the data is restricted to those obligations: no other use, such as analytics or marketing.
+- **Data the obligation does not cover gets short retention.** Technical logs, delivery attempts and redundant copies are deleted on their own schedule, or on request.
+- **After the period, delete.** Time partitioning makes this a partition drop, plus deleting the received files.
+- The engine processes debtor data for partners, so which party is controller for which data, and who answers a debtor's request, is a decision for the DPO, as is confirming the periods. This is not legal advice.
 
 ## Controls and operations
 
@@ -190,6 +223,7 @@ Undoing an executed payment is a separate refund or return flow.
 - Infrastructure as code and GitOps; pull request approval is maker-checker for platform changes; signed artifacts and SBOM; logged break-glass; keys in KMS/HSM.
 - Containers on the bank's platform, cloud or self-hosted; portability is the exit strategy.
 - Structured logs with correlation ids and an allowlist of loggable fields (no payment data). Business audit is `payment_event`; the security audit log is separate and tamper-evident.
+- Threats and their controls are in [threat-model.md](threat-model.md).
 - Alerts only when someone has something to do, each with an owner and runbook: oldest non-terminal item per state, unknown queue age, ingestion stalled, per-partner rejection spike, downstream circuit open, webhook delivery failing, reconciliation mismatch. Business rejections stay out of technical failure ratios. Runtime per-partner pause.
 - Public documentation where the status vocabulary is a contract ("accepted" means accepted for processing; cancellation is best effort; rounding rules). Legal reviews the wording. Published status values are forever.
 
@@ -212,6 +246,8 @@ The core loop was built and exercised against a real PostgreSQL: the state machi
 - **Events and references race.** An event arriving as its reference is stored could be left parked forever; a per-reference lock fixes it.
 - **Concurrent resends of the same instructions deadlocked** until rows were inserted in a fixed order.
 - **Every effect belongs in the outbox,** not only partner statuses, so that a worker dying after commit cannot lose a cancellation forward, a reconciliation request or an alert.
+- **An outage must not become manual work.** With a fixed number of retries, every payment in a 30-minute downstream outage ended in `UNKNOWN`. Backoff up to a horizon resolved all of them without a person (see [Downstream outages](#downstream-outages)).
+- **Paid is not settled.** Splitting them keeps the state graph honest: money that comes back after `PAID` is a mismatch, not a quiet change.
 
 Independent code reviews of the PoC found each of these before it could matter. What the PoC does not cover, and the known gaps in it, are in [poc-limits.md](poc-limits.md).
 
@@ -221,5 +257,7 @@ Independent code reviews of the PoC found each of these before it could matter. 
 - **Too-late cancellation** needs a partner-visible status, which is a contract decision.
 - **Source timestamps and raw provider messages** are needed for audit and must be kept from day one.
 - **Claim query performance** needs a rewrite that finds due rows and rows with inputs separately before any load test.
+- **Downstream key semantics** decide whether a resend is safe: key retention, what a repeated key returns, and its format. Get them from the first downstream's owners and test them before building its adapter.
+- **Volumes and latency targets** are not in the brief. One primary is enough at the volumes the brief implies, but that needs a load test with a synchronous standby before go-live.
 - **Reconciliation and manual resolution** of `UNKNOWN` and `MISMATCH` are where operations will live day to day; design them with operations early.
 - **Front doors, validation rules and screening** are scoped by the questions at the top, and need partners and the bank's risk functions.

@@ -179,14 +179,14 @@ The proof of concept stores these but its core loop does not read `acceptance_mo
 
 The unit of processing. One row per instruction.
 
-- **Identity.** `unique (partner_id, end_to_end_id)` is the idempotency key across channels and resends. `content_hash` detects a resend that reuses the id with different content: that is a conflict, never an update. It is computed over the parsed amount (so `12.5` and `12.50` are the same), with length-prefixed fields so no two different instructions can collide.
+- **Identity.** `unique (partner_id, end_to_end_id)` is the idempotency key across channels and resends. Partners must use a new end-to-end id for every instruction (a published rule), and the key must outlive archiving: when old rows are archived, keep `(partner_id, end_to_end_id, content_hash)` so an old id never becomes free again. `content_hash` detects a resend that reuses the id with different content: that is a conflict, never an update. It is computed over the parsed amount (so `12.5` and `12.50` are the same), with length-prefixed fields so no two different instructions can collide.
 - **Money.** `amount_minor` is an integer in the currency's minor units; `currency` is the ISO 4217 code. No floats anywhere.
-- **Work scheduling.** `next_action_at` is the due time. Null means no automatic work is due: either terminal (`PAID`, `REJECTED`, `REFUSED`, `EXPIRED`, `CANCELLED`) or waiting on a person (`UNKNOWN`, `MISMATCH`). Alerts on waiting states key on `state`, not on the due time. States that wait on the downstream (`SENDING`, `PRESENTED`, `ACCEPTED`, `CANCELLATION_REQUESTED`) are due after a response window, when the worker asks the downstream.
+- **Work scheduling.** `next_action_at` is the due time. Null means no automatic work is due: terminal (`SETTLED`, `REJECTED`, `REFUSED`, `EXPIRED`, `CANCELLED`), waiting on settlement (`PAID`, confirmed by reconciliation) or waiting on a person (`UNKNOWN`, `MISMATCH`). Alerts on waiting states key on `state`, not on the due time. States that wait on the downstream (`SENDING`, `PRESENTED`, `ACCEPTED`, `CANCELLATION_REQUESTED`) are due after a response window, when the worker asks the downstream. While the downstream is unreachable, the due time backs off from 30 seconds to 10 minutes, ending at the outage horizon.
 - **Only the lease holder writes state.** External inputs never update this table directly: provider events go to `provider_inbox`, cancellations to `cancellation_request`, approved manual actions stay in `manual_action`. The worker picks them up under a lease (the claim query includes payments with unapplied inputs) and applies them through the state machine. This is what makes the fence complete.
 - **Lease and fencing.** `lease_owner` and `lease_until` record the current claim. `lease_token` increments on every claim. The result is a compare-and-set: `WHERE id = ? AND lease_token = ? AND event_seq = ?`. A slow worker cannot overwrite a takeover, and nothing else can have written in between. Every successful write renews the lease. Releasing it (null owner and expiry) is fenced on the token alone.
 - **Event sequence.** `event_seq` is the last sequence number written to `payment_event` for this payment. The fenced update increments it by the number of events being written (more than one when a transition records inferred states) and returns the new value; every `payment_event` insert takes its `seq` from that value in the same transaction. That keeps the sequence gap-free and ordered, which the partitioned event table cannot enforce on its own.
 - **Downstream.** `downstream` and `send_attempt` are stored in the transaction that records `SENDING`, before the downstream call, so a takeover mid-send knows which attempt was in flight. `downstream_ref` is stored only once the downstream has answered (the send response or a status query), so it can be null for a payment that was sent; events for such a payment stay parked until the reference is learned. The downstream idempotency key is derived from payment id and attempt, never from the worker. A reference that is not usable (empty, too long, control characters, or already held by another payment) is never stored: the payment goes to `UNKNOWN`.
-- **Downstream position and cancellation** (V2). `downstream_position` is the last known downstream state (`SENDING`, `PRESENTED` or `ACCEPTED`), null until `SENDING` was recorded, which happens before the downstream call. It survives `UNKNOWN` and `CANCELLATION_REQUESTED`, which would otherwise forget how far the payment got: a late event is stale or applied relative to it, never relative to a guess. `cancel_requested` is set when a partner cancellation was applied; only then can a downstream cancellation confirmation be accepted, and not once the position is `ACCEPTED`. The state machine reads and returns both with the state. The `CHECK` on `downstream_position` is the one place the schema constrains state names; renaming an in-flight state needs a migration.
+- **Downstream position and cancellation** (V2). `downstream_position` is the last known downstream state (`SENDING`, `PRESENTED` or `ACCEPTED`; a `PAID` payment is its own position, since it can no longer time out), null until `SENDING` was recorded, which happens before the downstream call. It survives `UNKNOWN` and `CANCELLATION_REQUESTED`, which would otherwise forget how far the payment got: a late event is stale or applied relative to it, never relative to a guess. `cancel_requested` is set when a partner cancellation was applied; only then can a downstream cancellation confirmation be accepted, and not once the position is `ACCEPTED`. The state machine reads and returns both with the state. The `CHECK` on `downstream_position` is the one place the schema constrains state names; renaming an in-flight state needs a migration.
 - **Plans.** `parent_ref` is an optional reference for whoever owns a payment plan. The engine does not interpret it.
 
 ### State values
@@ -197,8 +197,9 @@ The `state` column is not constrained in the schema while the state list is a dr
 |---|---|
 | Worker steps | `RECEIVED`, `VALIDATED`, `PENDING_SCREENING`, `READY_TO_SEND` |
 | Waiting on the downstream | `SENDING`, `PRESENTED`, `ACCEPTED`, `CANCELLATION_REQUESTED` |
+| Waiting on settlement | `PAID` |
 | Waiting on a person | `UNKNOWN`, `MISMATCH` |
-| Terminal | `PAID`, `REJECTED`, `REFUSED`, `EXPIRED`, `CANCELLED` |
+| Terminal | `SETTLED`, `REJECTED`, `REFUSED`, `EXPIRED`, `CANCELLED` |
 
 ## payment_event
 
@@ -206,13 +207,13 @@ Append-only. The application role has `INSERT` and `SELECT` only; no `UPDATE` or
 
 - One row per lifecycle event: `type`, `from_state`, `to_state`. A transition that infers skipped states writes one row per step.
 - `outcome`: `APPLIED`, `INFERRED` (a skipped state on a valid path), `STALE` (recorded, not applied) or `NO_PATH` (contradicts the current state; the payment moves to `MISMATCH`).
-- `category`: `BUSINESS` or `TECHNICAL`, so retries do not bury the events an auditor needs. `STALE` steps and bookkeeping that changes no state (storing a reference, an unavailable status answer) are `TECHNICAL`.
+- `category`: `BUSINESS` or `TECHNICAL`, so retries do not bury the events an auditor needs. `STALE` steps and bookkeeping that changes no state (storing a reference, a failed call during an outage) are `TECHNICAL`.
 - `actor_type` and `actor_id`: partner, internal service, downstream, or admin user.
 - `reason` and `manual_action_id` are required for `ADMIN` events (check constraint). That the linked action is approved is enforced by the application, not the schema.
 - `occurred_at` (when it happened, per the source) and `recorded_at` (when we wrote it) are meant to differ for late downstream events. The proof of concept sets both to the time the worker applied the step; keep the source time from day one.
 - `correlation_id` traces one file or API call across all its payments. `inbox_event_id` links to the raw provider event.
 - `payload` holds mapped reason codes and downstream references, never personal data. The raw provider message stays in `provider_inbox`, linked by `inbox_event_id`.
-- Partitioned by `recorded_at`, monthly. The migration creates 2026-11 to 2027-01; a scheduled job creates partitions ahead of time. The default partition is a safety net that should stay empty: a row there is an alert, because it blocks creating the partition for that range. Old partitions are detached and archived, subject to the retention policy.
+- Partitioned by `recorded_at`, monthly. The migration creates 2026-11 to 2027-01; a scheduled job creates partitions ahead of time. The default partition is a safety net that should stay empty: a row there is an alert, because it blocks creating the partition for that range. Old partitions are detached and archived, and dropped at the end of the retention period ([architecture.md](architecture.md#retention-and-erasure)).
 
 ### Event types
 
@@ -222,10 +223,12 @@ Append-only. The application role has `INSERT` and `SELECT` only; no `UPDATE` or
 | `VALIDATED`, `SCREENING_STARTED`, `SCREENING_PASSED` | The worker's pass-through steps |
 | `SENDING` | Before the downstream call, with the attempt number |
 | `SEND_RESPONSE`, `SEND_REJECTED` | The downstream answered the send |
-| `SEND_TIMEOUT`, `SEND_TIMEOUT_RECOVERED` | The send raised an error; the status query found nothing, or found the payment |
+| `SEND_TIMEOUT_RECOVERED` | The send raised an error, and the status query found the payment |
+| `SEND_FAILED` | The send raised an error, and the downstream has nothing: resent later under the same key |
+| `STATUS_UNAVAILABLE` | A status query went unanswered: asked again later |
+| `SEND_TIMEOUT` | A send's outage outlasted the horizon: the payment goes to `UNKNOWN` |
 | `STATUS_QUERY` | A status query changed something: stored the reference, or reported a state |
-| `STATUS_UNAVAILABLE` | A status query went unanswered; it is retried a few times |
-| `RESPONSE_TIMEOUT` | The response window passed in silence |
+| `RESPONSE_TIMEOUT` | The response window passed with no progress the downstream can explain, or a status outage outlasted the horizon |
 | `UNUSABLE_REFERENCE` | The downstream's reference could not be stored |
 | `PROVIDER_EVENT` | A downstream event from the inbox was applied |
 | `CANCEL_REQUESTED` | A partner cancellation was applied |
@@ -268,7 +271,7 @@ Debtor and creditor identification lives in `payment_request`, not in `payment_e
 
 Downstream calls are made by the worker directly, under its lease, not through the outbox; request bodies are not stored.
 
-Erasure runs under the maintenance role: identification columns on `payment_request` are nulled, payloads are redacted in place (`'{}'`) once delivered, and received files are deleted. It never deletes rows that `payment_event` links to.
+Payment records are kept for the legal retention period, and an erasure request during that period restricts their use rather than deleting them ([architecture.md](architecture.md#retention-and-erasure)). Deletion runs under the maintenance role at the end of the period: partitions are dropped and received files deleted. Data no obligation covers, such as delivered outbox payloads, is redacted in place (`'{}'`) on its own shorter schedule or on request.
 
 ## Transactions
 
