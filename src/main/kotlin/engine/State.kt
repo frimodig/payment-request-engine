@@ -1,7 +1,11 @@
 package engine
 
 // Draft state list from docs/architecture.md; the schema leaves state values unconstrained until it is frozen.
-enum class State(val terminal: Boolean = false, val waitsForPerson: Boolean = false) {
+enum class State(
+    val terminal: Boolean = false,
+    val waitsForPerson: Boolean = false,
+    val waitsForSettlement: Boolean = false,
+) {
     RECEIVED,
     VALIDATED,
     PENDING_SCREENING,
@@ -14,15 +18,20 @@ enum class State(val terminal: Boolean = false, val waitsForPerson: Boolean = fa
     UNKNOWN(waitsForPerson = true),
     MISMATCH(waitsForPerson = true),
 
-    PAID(terminal = true),
+    // The downstream reports the payment made. Money can still come back; reconciliation against the partner's
+    // account confirms SETTLED, so no timer runs here: an overdue PAID is for reconciliation and monitoring.
+    PAID(waitsForSettlement = true),
     REJECTED(terminal = true),
     REFUSED(terminal = true),
     EXPIRED(terminal = true),
     CANCELLED(terminal = true),
+
+    /** The money is confirmed in the partner's account: the final outcome of a payment. */
+    SETTLED(terminal = true),
     ;
 
     // Null next_action_at in the database means exactly this: no automatic work is due.
-    val hasAutomaticWork: Boolean get() = !terminal && !waitsForPerson
+    val hasAutomaticWork: Boolean get() = !terminal && !waitsForPerson && !waitsForSettlement
 
     // Sent, and only the downstream can move it on; the worker acts on silence after a response window.
     val waitsForDownstream: Boolean
@@ -36,7 +45,7 @@ enum class State(val terminal: Boolean = false, val waitsForPerson: Boolean = fa
     // RECEIVED is acknowledged at ingestion, not by a transition.
     val partnerVisible: Boolean
         get() = when (this) {
-            PRESENTED, ACCEPTED, CANCELLATION_REQUESTED, PAID, REJECTED, REFUSED, EXPIRED, CANCELLED -> true
+            PRESENTED, ACCEPTED, CANCELLATION_REQUESTED, PAID, SETTLED, REJECTED, REFUSED, EXPIRED, CANCELLED -> true
             else -> false
         }
 }
@@ -50,4 +59,5 @@ enum class ProviderStatus(val reports: State) {
     REFUSED(State.REFUSED),
     EXPIRED(State.EXPIRED),
     CANCELLED(State.CANCELLED),
+    SETTLED(State.SETTLED),
 }

@@ -138,16 +138,49 @@ class ScenarioTests {
     }
 
     @Test
-    fun `a contradicting final event after PAID is stale and raises an alert`() {
+    fun `a payment is PAID until settlement confirms it, and settlement arriving first is not lost`() {
+        val inOrder = sent("E1")
+        deliver(inOrder, ProviderStatus.PRESENTED, ProviderStatus.ACCEPTED, ProviderStatus.PAID)
+        drain(worker("A"))
+        val paid = tables.payment(inOrder)
+        assertEquals("PAID", paid.state)
+        assertEquals(null, paid.nextActionAt, "PAID waits for reconciliation, not for a timer")
+
+        val reversed = sent("E2")
+        deliver(reversed, ProviderStatus.PRESENTED, ProviderStatus.ACCEPTED, ProviderStatus.PAID, ProviderStatus.SETTLED, reorder = true)
+        deliver(inOrder, ProviderStatus.SETTLED)
+        drain(worker("A"))
+
+        for (id in listOf(inOrder, reversed)) {
+            assertEquals("SETTLED", tables.payment(id).state)
+            assertEquals(listOf("PRESENTED", "ACCEPTED", "PAID", "SETTLED"), tables.partnerStatuses(id))
+        }
+    }
+
+    @Test
+    fun `a contradicting final event after SETTLED is stale and raises an alert`() {
         val id = sent()
-        deliver(id, ProviderStatus.PAID)
+        deliver(id, ProviderStatus.SETTLED)
         drain(worker("A"))
         deliver(id, ProviderStatus.REFUSED)
         drain(worker("A"))
 
-        assertEquals("PAID", tables.payment(id).state)
+        assertEquals("SETTLED", tables.payment(id).state)
         assertEquals("STALE", tables.events(id).last().outcome)
         assertTrue(tables.outbox(id).any { it.first == "ALERT" && it.second.contains("CONTRADICTING_EVENT_AFTER_TERMINAL") })
+    }
+
+    @Test
+    fun `a reject after PAID means money came back, so MISMATCH for a person and partners not told`() {
+        val id = sent()
+        deliver(id, ProviderStatus.PAID)
+        drain(worker("A"))
+        deliver(id, ProviderStatus.REJECTED)
+        drain(worker("A"))
+
+        assertEquals("MISMATCH", tables.payment(id).state)
+        assertTrue(tables.outbox(id).any { it.first == "ALERT" && it.second.contains("MISMATCH") })
+        assertEquals(listOf("PRESENTED", "ACCEPTED", "PAID"), tables.partnerStatuses(id))
     }
 
     @Test

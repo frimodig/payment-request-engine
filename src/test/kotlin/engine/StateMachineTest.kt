@@ -42,6 +42,7 @@ class StateMachineTest {
     private val sending = run(Advance(SENDING), from = ready)
     private val presented = run(reported(ProviderStatus.PRESENTED), from = sending)
     private val accepted = run(reported(ProviderAccepted), from = presented)
+    private val paid = run(reported(ProviderStatus.PAID), from = sending)
 
     private val unsent = listOf(
         Context.initial,
@@ -51,7 +52,7 @@ class StateMachineTest {
     )
 
     private val terminals: Map<State, Context> = mapOf(
-        PAID to run(reported(ProviderStatus.PAID), from = sending),
+        SETTLED to run(reported(ProviderStatus.SETTLED), from = sending),
         REJECTED to run(reported(ProviderStatus.REJECTED), from = sending),
         REFUSED to run(reported(ProviderStatus.REFUSED), from = presented),
         EXPIRED to run(reported(ProviderStatus.EXPIRED), from = presented),
@@ -144,6 +145,10 @@ class StateMachineTest {
         assertEquals(listOf(Outcome.STALE), result.outcomes())
     }
 
+    // The outcomes a downstream can report. PAID and SETTLED are one outcome, money moved, at two stages.
+    private val outcomes = setOf(PAID, SETTLED, REJECTED, REFUSED, EXPIRED, CANCELLED)
+    private fun sameOutcome(a: State, b: State) = a == b || setOf(a, b) == setOf(PAID, SETTLED)
+
     @Test
     fun `provider event on a terminal payment is stale, and alerted only if it contradicts the outcome`() {
         for ((terminal, ctx) in terminals) {
@@ -151,7 +156,7 @@ class StateMachineTest {
                 val result = ctx.then(reported(status))
                 assertEquals(ctx, result.context, "$terminal after $status")
                 assertEquals(listOf(Outcome.STALE), result.outcomes())
-                val contradicts = status.reports.terminal && status.reports != terminal
+                val contradicts = status.reports in outcomes && !sameOutcome(terminal, status.reports)
                 val expected = if (contradicts) {
                     listOf<Effect>(Effect.RaiseAlert(AlertReason.CONTRADICTING_EVENT_AFTER_TERMINAL))
                 } else {
@@ -164,12 +169,67 @@ class StateMachineTest {
 
     @Test
     fun `money moving after a cancellation is recorded as stale and alerted`() {
-        val result = terminals.getValue(CANCELLED).then(reported(ProviderStatus.PAID))
-        assertEquals(CANCELLED, result.state)
-        assertEquals(
-            listOf<Effect>(Effect.RaiseAlert(AlertReason.CONTRADICTING_EVENT_AFTER_TERMINAL)),
-            result.steps.single().effects,
-        )
+        for (status in listOf(ProviderStatus.PAID, ProviderStatus.SETTLED)) {
+            val result = terminals.getValue(CANCELLED).then(reported(status))
+            assertEquals(CANCELLED, result.state)
+            assertEquals(
+                listOf<Effect>(Effect.RaiseAlert(AlertReason.CONTRADICTING_EVENT_AFTER_TERMINAL)),
+                result.steps.single().effects,
+                "$status after CANCELLED",
+            )
+        }
+    }
+
+    // --- Paid, then settled -------------------------------------------------------------------
+
+    @Test
+    fun `PAID waits for settlement, and SETTLED is the final outcome`() {
+        assertFalse(PAID.terminal)
+        assertFalse(PAID.hasAutomaticWork, "settlement comes from reconciliation, not from a timer")
+        assertTrue(SETTLED.terminal)
+        val result = paid.then(reported(ProviderStatus.SETTLED))
+        assertEquals(SETTLED, result.state)
+        assertEquals(listOf(Outcome.APPLIED), result.outcomes())
+        assertEquals(listOf<Effect>(Effect.PartnerStatus(SETTLED)), result.steps.single().effects)
+    }
+
+    @Test
+    fun `settlement reported before payment infers PAID and every state before it`() {
+        val result = sending.then(reported(ProviderStatus.SETTLED))
+        assertEquals(listOf(PRESENTED, ACCEPTED, PAID, SETTLED), result.steps.map { it.to })
+        assertEquals(List(3) { Outcome.INFERRED } + Outcome.APPLIED, result.outcomes())
+    }
+
+    @Test
+    fun `a repeated or earlier event on a PAID payment is stale`() {
+        for (status in listOf(ProviderStatus.PRESENTED, ProviderAccepted, ProviderStatus.PAID)) {
+            val result = paid.then(reported(status))
+            assertEquals(paid, result.context, "$status")
+            assertEquals(listOf(Outcome.STALE), result.outcomes())
+            assertTrue(result.steps.single().effects.isEmpty(), "$status")
+        }
+    }
+
+    @Test
+    fun `a different outcome after PAID is a mismatch for a person, never a quiet change`() {
+        for (status in listOf(ProviderStatus.REJECTED, ProviderStatus.REFUSED, ProviderStatus.EXPIRED, ProviderStatus.CANCELLED)) {
+            val result = paid.then(reported(status))
+            assertEquals(MISMATCH, result.state, "$status after PAID")
+            assertEquals(listOf<Effect>(Effect.RaiseAlert(AlertReason.MISMATCH)), result.steps.single().effects)
+        }
+    }
+
+    @Test
+    fun `a PAID payment can no longer be cancelled and does not time out`() {
+        assertEquals(listOf(Outcome.STALE), paid.then(CancelRequested).outcomes())
+        assertEquals(listOf(Outcome.STALE), paid.then(ResponseTimeout).outcomes())
+    }
+
+    @Test
+    fun `a late settlement resolves UNKNOWN after acceptance`() {
+        val unknown = accepted.then(ResponseTimeout).context
+        val result = unknown.then(reported(ProviderStatus.SETTLED))
+        assertEquals(listOf(PAID, SETTLED), result.steps.map { it.to })
     }
 
     @Test
@@ -219,14 +279,14 @@ class StateMachineTest {
     @Test
     fun `timeout never produces a failed state`() {
         val failed = setOf(REJECTED, REFUSED, EXPIRED, CANCELLED, MISMATCH)
-        for (ctx in unsent + sending + presented + accepted + terminals.values + mismatch) {
+        for (ctx in unsent + sending + presented + accepted + paid + terminals.values + mismatch) {
             assertFalse(ctx.then(ResponseTimeout).state in failed - ctx.state, "from ${ctx.state}")
         }
     }
 
     @Test
     fun `timeout that fires after the payment moved on is stale`() {
-        for (ctx in listOf(terminals.getValue(PAID), run(ResponseTimeout, from = sending), mismatch, unsent[0])) {
+        for (ctx in listOf(paid, terminals.getValue(SETTLED), run(ResponseTimeout, from = sending), mismatch, unsent[0])) {
             val result = ctx.then(ResponseTimeout)
             assertEquals(ctx, result.context)
             assertEquals(listOf(Outcome.STALE), result.outcomes())
@@ -298,7 +358,7 @@ class StateMachineTest {
 
     @Test
     fun `cancelling after acceptance is too late and recorded as stale`() {
-        val contexts = listOf(accepted, accepted.then(ResponseTimeout).context, mismatch) + terminals.values
+        val contexts = listOf(accepted, accepted.then(ResponseTimeout).context, paid, mismatch) + terminals.values
         for (late in contexts) {
             val result = late.then(CancelRequested)
             assertEquals(late, result.context, "from ${late.state}")
@@ -437,7 +497,7 @@ class StateMachineTest {
 
     @Test
     fun `a payment never moves backwards on the main path`() {
-        val rank = listOf(SENDING, PRESENTED, ACCEPTED, PAID)
+        val rank = listOf(SENDING, PRESENTED, ACCEPTED, PAID, SETTLED)
         explore(9) { ctx, result, _, path ->
             val position = (result as? Transition.Valid)?.context?.position ?: return@explore
             val before = ctx.position ?: return@explore
@@ -480,7 +540,7 @@ class StateMachineTest {
     @Test
     fun `partners only see downstream-facing states`() {
         assertEquals(
-            setOf(PRESENTED, ACCEPTED, CANCELLATION_REQUESTED, PAID, REJECTED, REFUSED, EXPIRED, CANCELLED),
+            setOf(PRESENTED, ACCEPTED, CANCELLATION_REQUESTED, PAID, SETTLED, REJECTED, REFUSED, EXPIRED, CANCELLED),
             State.entries.filter { it.partnerVisible }.toSet(),
         )
     }

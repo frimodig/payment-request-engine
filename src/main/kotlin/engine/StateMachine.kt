@@ -77,10 +77,13 @@ object PaymentStateMachine {
         State.SENDING to listOf(State.PRESENTED, State.REJECTED),
         State.PRESENTED to listOf(State.ACCEPTED, State.REFUSED, State.EXPIRED),
         State.ACCEPTED to listOf(State.PAID),
+        State.PAID to listOf(State.SETTLED),
     )
 
     // Position on the main path, to tell "behind or equal" (stale) from "no path" (mismatch).
-    private val mainPathRank = mapOf(State.SENDING to 0, State.PRESENTED to 1, State.ACCEPTED to 2, State.PAID to 3)
+    private val mainPathRank = mapOf(
+        State.SENDING to 0, State.PRESENTED to 1, State.ACCEPTED to 2, State.PAID to 3, State.SETTLED to 4,
+    )
 
     private val inFlight = setOf(State.SENDING, State.PRESENTED, State.ACCEPTED)
     private val cancelPending = setOf(State.CANCELLATION_REQUESTED, State.UNKNOWN)
@@ -109,11 +112,13 @@ object PaymentStateMachine {
         if (current.terminal) {
             // Recorded, never applied. A different final outcome (CANCELLED then PAID: money moved after
             // a cancellation) is parked for a person; an out-of-order or duplicate event is benign.
-            val contradicts = target.terminal && target != current
+            val contradicts = contradicts(current, target)
             val alert = Effect.RaiseAlert(AlertReason.CONTRADICTING_EVENT_AFTER_TERMINAL)
             return stale(ctx, if (contradicts) listOf(alert) else emptyList())
         }
-        val position = ctx.position ?: return noPath(ctx)
+        // How far the downstream is known to have got: the state itself while it is on the main path (PAID is never
+        // stored as a position), otherwise the position kept through UNKNOWN and CANCELLATION_REQUESTED.
+        val position = current.takeIf { it in mainPathRank } ?: ctx.position ?: return noPath(ctx)
 
         if (target == State.CANCELLED) {
             // Only a cancellation we asked for can be confirmed.
@@ -154,6 +159,15 @@ object PaymentStateMachine {
             // Too late (accepted, paid, terminal) or not meaningful (mismatch, already requested).
             else -> stale(ctx)
         }
+    }
+
+    // A different outcome than the one the payment already has. PAID counts as an outcome although it is not final:
+    // money moved, so a cancellation or a reject after it needs a person. An outcome behind the current one on the
+    // main path (PAID after SETTLED) is just late.
+    private fun contradicts(current: State, target: State): Boolean {
+        val isOutcome = target.terminal || target == State.PAID
+        val late = mainPathRank[target]?.let { it < (mainPathRank[current] ?: -1) } ?: false
+        return isOutcome && target != current && !late
     }
 
     // Unknown never expires into failed: a timeout can only lead to UNKNOWN.
