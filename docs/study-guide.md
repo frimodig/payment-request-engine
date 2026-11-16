@@ -34,7 +34,7 @@ Each idea: what it is, why it exists, where it lives, and the test that shows it
 
 ### 3.1 Every state with work has a due time
 
-Each payment row has `state` and `next_action_at`. There is one kind of work: claim a payment that is due or has a new input, apply the input or do the step the state calls for, write the new state and the next due time. No due time means no automatic work: terminal, or waiting on a person.
+Each payment row has `state` and `next_action_at`. There is one kind of work: claim a payment that is due or has a new input, apply the input or do the step the state calls for, write the new state and the next due time. No due time means no automatic work: terminal, waiting on settlement (`PAID`), or waiting on a person.
 
 - *Why:* retries, backoff, timeouts and expiry are all "a due time". There is no separate scheduler, no queue broker, and a crashed worker loses nothing because the work is in the table.
 - *Where:* `Worker.runOnce`, `Worker.scheduleFor`, `State.hasAutomaticWork`.
@@ -119,17 +119,18 @@ Downstream events are stored exactly as received and acknowledged immediately, d
 
 ## 4. Reading the code
 
-About 1,300 lines of main code. Read in this order; each file is short.
+About 1,500 lines of main code. Read in this order; each file is short.
 
-1. [State.kt](../src/main/kotlin/engine/State.kt): the states and which are terminal, waiting on a person, waiting on the downstream, or visible to partners.
+1. [State.kt](../src/main/kotlin/engine/State.kt): the states and which are terminal, waiting on a person, waiting on settlement, waiting on the downstream, or visible to partners.
 2. [StateMachine.kt](../src/main/kotlin/engine/StateMachine.kt): `transition`, then `providerReported` (the heart of 3.5), then `cancelRequested` and `responseTimeout`.
 3. [Money.kt](../src/main/kotlin/engine/Money.kt) and [Db.kt](../src/main/kotlin/engine/Db.kt): small helpers; note `lockReference`.
 4. [Store.kt](../src/main/kotlin/engine/Store.kt): `claim`, `apply`, `release`. The whole concurrency story is in these three.
 5. [Ingestion.kt](../src/main/kotlin/engine/Ingestion.kt): `submit` and the content hash.
-6. [Downstream.kt](../src/main/kotlin/engine/Downstream.kt) and [FakeDownstream.kt](../src/main/kotlin/engine/FakeDownstream.kt): the boundary, and the fake that can delay, time out, reject, duplicate and reorder.
-7. [Worker.kt](../src/main/kotlin/engine/Worker.kt): `runOnce`, then `timedStep`, `checkSending`, `checkWaiting`.
+6. [Downstream.kt](../src/main/kotlin/engine/Downstream.kt) and [FakeDownstream.kt](../src/main/kotlin/engine/FakeDownstream.kt): the boundary, and the fake that can delay, time out, reject, duplicate, reorder and go down.
+7. [Worker.kt](../src/main/kotlin/engine/Worker.kt): `runOnce`, then `timedStep`, `checkSending`, `checkWaiting`, `unreachable`.
+8. [WebhookTarget.kt](../src/main/kotlin/engine/WebhookTarget.kt): which partner webhook URLs may be called.
 
-Then the tests, in this order: `StateMachineTest` (the explorer), `ScenarioTests` (the five failure scenarios the PoC exists to prove), `HardeningTests` (races and awkward inputs found by the reviews; each failed before its fix).
+Then the tests, in this order: `StateMachineTest` (the explorer), `ScenarioTests` (the five failure scenarios the PoC exists to prove), `HardeningTests` (races and awkward inputs found by the reviews; each failed before its fix), `OutageTests` (downstream outages) and `WebhookTargetTest`.
 
 ## 5. Exercises
 
@@ -242,3 +243,4 @@ First the blocking step 0: canonical model, transition table, event schema, stat
 | Why each choice was made, in order | [poc-decisions.md](poc-decisions.md) |
 | What the reviews found and what became of it | [review-findings.md](review-findings.md) |
 | Threats and their controls | [threat-model.md](threat-model.md) |
+| How failures recover, and what needs a person | [recovery.md](recovery.md) |

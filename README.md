@@ -9,6 +9,7 @@ A recommendation for how to build a partner payment processing engine: it receiv
 
 - [docs/architecture.md](docs/architecture.md): the recommendation, structured around the brief, with the evidence from the proof of concept and the open risks.
 - [docs/database.md](docs/database.md): the recommended data model: tables, columns, indexes and the rules they enforce.
+- [docs/recovery.md](docs/recovery.md): how the engine recovers from failures, with and without a downstream status endpoint, and what still needs a person.
 - [docs/poc-limits.md](docs/poc-limits.md): what the proof of concept does not cover, and its known gaps.
 - [docs/review-findings.md](docs/review-findings.md): what the code reviews and the adversarial review of the plan found, and what became of each finding.
 - [docs/threat-model.md](docs/threat-model.md): threats per trust boundary and the control for each.
@@ -20,7 +21,8 @@ A recommendation for how to build a partner payment processing engine: it receiv
   - `State.kt`, `StateMachine.kt`: the pure state machine. Transitions return valid or invalid, side effects as data.
   - `Ingestion.kt`: submissions become deduplicated instructions (partner + end-to-end id).
   - `Store.kt`, `Worker.kt`: claim with `FOR UPDATE SKIP LOCKED`, lease, fenced write, one transaction per state change.
-  - `Downstream.kt`, `FakeDownstream.kt`: the downstream boundary and a fake that can delay, time out, reject, duplicate and reorder.
+  - `Downstream.kt`, `FakeDownstream.kt`: the downstream boundary and a fake that can delay, time out, reject, duplicate, reorder and go down.
+  - `WebhookTarget.kt`: decides whether a partner's webhook URL may be called (no internal addresses).
 - `src/test`: unit tests, and scenario tests against a real Postgres.
 
 ## Build

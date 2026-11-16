@@ -18,7 +18,7 @@ The proof of concept built the core loop (CLAUDE.md lists its scope) to check th
 ## Behaviour gaps
 
 - **Too-late cancellation is silent.** A cancellation that arrives after acceptance (or when already requested, or on a `MISMATCH`) is recorded as a technical `STALE` event and marked applied. The partner is not told it was refused. Telling them needs a new partner status, and published statuses are forever.
-- **One response window** serves `SENDING`, `PRESENTED` and `ACCEPTED`, though the last two wait on a debtor. A silent downstream moves them to `UNKNOWN` after the window and the retries.
+- **One response window** serves `SENDING`, `PRESENTED` and `ACCEPTED`, though the last two wait on a debtor. A silent downstream moves them to `UNKNOWN` one window after it stops answering; an unreachable one, after the outage horizon.
 - **Partner status order during a cancellation depends on delivery order.** A `PRESENTED` acknowledgement is kept off the partner's list only when it arrives on its own. If the downstream skips or reorders it, the partner sees `PRESENTED` after `CANCELLATION_REQUESTED`. Final state and money are the same.
 - **Contradicting final events are `TECHNICAL`.** `PAID` after `CANCELLED` is recorded as a stale technical event with an `ALERT` outbox row. A business-audit query on `category = 'BUSINESS'` does not show it.
 - **Provider events lose their source.** `occurred_at` and `recorded_at` are both the time the worker applied the step, `provider_timestamp` is our receive time, and the inbox keeps only `{"status": ...}`, not the raw message.
@@ -26,7 +26,7 @@ The proof of concept built the core loop (CLAUDE.md lists its scope) to check th
 - **A downstream that knows a payment in `SENDING` but does not move it within one response window** sends it to `UNKNOWN`. In `PRESENTED` and `ACCEPTED` the same answer keeps the payment waiting.
 - **The idempotency key is `paymentId:attempt`, 38 characters,** longer than the 35 characters ISO 20022 identifiers allow. The adapter for an ISO downstream must map it.
 - **Resends go through the worker's own adapter,** not the one named in `payment_request.downstream`. Fine with one downstream.
-- **A reference the downstream gives that is unusable** (empty, over 200 characters, control characters, or held by another payment) sends the payment to `UNKNOWN`. `ProviderInbox.receive` still throws for such a reference in an event instead of rejecting it cleanly.
+- **A reference the downstream gives that is unusable** (empty, over 200 characters, control characters, or held by another payment) sends the payment to `UNKNOWN`. `ProviderInbox.receive` throws for an event whose reference holds a NUL character; other unusable references in events are stored and parked, or matched to the payment that holds them.
 - **A downstream reason code** is stored without control characters and cut to 64 characters.
 
 ## Robustness gaps
@@ -35,7 +35,7 @@ The proof of concept built the core loop (CLAUDE.md lists its scope) to check th
 - **Partner input is not fully validated.** A NUL character or a very long end-to-end id makes the insert fail and rolls back the whole submission, contradicting partial acceptance. `Money.parse` has no length limit, and a very long amount holds the submit transaction for seconds to minutes.
 - **The content hash has no version.** Changing its format makes older payments look like conflicts on resend. There is no persisted data in the PoC.
 - **The lease is renewed by writes, not a heartbeat.** A single step that outlasts the lease can be taken over mid-step; the fenced write then fails, which is the safe outcome. But nothing bounds a step: downstream calls and JDBC statements have no timeout, and leases and due times come from each instance's clock, not the database's. A hung call or a skewed clock lets a second worker call the downstream while the first is still in its call; the key then decides whether that creates a second payment.
-- **An outage streak ends on any status answer, or any other event that changes something.** A cancellation applied during an outage restarts the horizon and the backoff; a repeated webhook does not, because webhooks can arrive while status queries fail.
+- **An outage streak ends on a status answer that finds the payment, or any other event that changes something.** A send endpoint that stays down while status queries answer "not found" is one outage, so the payment reaches `UNKNOWN` at the horizon. A cancellation applied during an outage restarts the horizon and the backoff; a repeated webhook does not, because webhooks can arrive while status queries fail.
 - **A cancelled payment the downstream never received ends in `UNKNOWN`.** A payment waiting in `SENDING` because its send failed moves to `CANCELLATION_REQUESTED` when cancelled, and the downstream then cannot find it. It could be cancelled outright, but only once nothing can still be in flight for it.
 - **No fairness between partners or channels.** Claims go by inputs first, then due time. A large file delays every step of a payment submitted through the API after it.
 - **Inputs are claimed before timers.** They are consumed by the run that claims them, so only a continuous flood of new events could delay a timeout. Within the inputs, claims go by due time with nulls last, not by arrival.

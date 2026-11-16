@@ -10,6 +10,7 @@ After the code reviews, two independent challengers reviewed the recommendation 
 |---|---|
 | Every payment caught in a downstream outage of about 90 seconds or more went to `UNKNOWN` for a person | Fixed: backoff up to an outage horizon ([architecture.md](architecture.md#downstream-outages)); tested with a 30-minute outage |
 | A send that failed while the downstream answered "not found" went straight to `UNKNOWN` | Fixed: resent later under the same key |
+| (Re-check of the fixes) A status answer that reported nothing new did not end an outage, so a short outage hours after another sent payments straight to `UNKNOWN` | Fixed: a status answer that finds the payment ends an outage |
 | `PAID` was final, so money coming back after it had no place, and partial payment was undefined | Fixed: `PAID` waits for `SETTLED`, which reconciliation confirms for the full amount; a different outcome after `PAID` is a `MISMATCH` |
 | The docs said files are ingested in bounded transactions; the PoC uses one transaction per submission | Corrected: staged, chunked ingestion is the recommendation, and the gap is listed |
 | Resend safety rests on downstream key semantics nobody has checked: retention, what a repeated key returns, format (our key is 38 characters, ISO ids 35) | Documented as adapter requirements and a risk |
@@ -28,7 +29,7 @@ After the code reviews, two independent challengers reviewed the recommendation 
 | # | Finding | Outcome |
 |---|---|---|
 | 1 | A takeover resent a payment whose downstream reference was already stored; the second reference replaced the first | Fixed: the payment goes to `UNKNOWN` |
-| 2 | A downstream reference the database cannot store (NUL, oversize, duplicate) left the payment retrying forever in `SENDING` | Fixed: goes to `UNKNOWN`. The inbox still throws for such a reference in an event (documented) |
+| 2 | A downstream reference the database cannot store (NUL, oversize, duplicate) left the payment retrying forever in `SENDING` | Fixed: goes to `UNKNOWN`. The inbox still throws for an event whose reference holds a NUL character (documented) |
 | 3 | An overdue takeover applied a pending cancellation before checking the downstream, losing the reference | Fixed: the overdue send is checked first |
 | 4 | `PRESENTED`, `ACCEPTED` and `CANCELLATION_REQUESTED` timed out to `UNKNOWN` without asking the downstream, so a lost webhook left a paid payment unknown | Fixed: the downstream is asked first |
 | 5 | A `CANCELLED` confirmation after the debtor accepted was applied once the payment had timed out to `UNKNOWN` | Fixed: a mismatch, with or without the timeout |

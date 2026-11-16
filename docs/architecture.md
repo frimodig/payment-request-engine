@@ -105,7 +105,7 @@ Parse and validate at the edge, then work on one canonical instruction. Channel 
 - Ingestion stores a row due now.
 - After sending, due = now + expected response window.
 - A downstream event arrives: it is stored in the provider inbox, and the worker that claims the payment applies it through the state machine. Only the lease holder ever changes a payment's state; events, cancellations and approved manual actions are inputs it picks up.
-- The event never arrives: the due time passes and the worker queries the downstream. If it reports a later state, the payment is caught up through the state machine; if it reports the same state, the payment keeps waiting for another window; if it cannot find the payment, the payment moves to `UNKNOWN`. If it does not answer, that is an outage (see [Downstream outages](#downstream-outages)).
+- The event never arrives: the due time passes and the worker queries the downstream. If it reports a later state, the payment is caught up through the state machine; if it reports the same state, the payment keeps waiting for another window; if it cannot find a payment it has already acknowledged, the payment moves to `UNKNOWN` (a send it never received is resent, see below). If it does not answer, that is an outage (see [Downstream outages](#downstream-outages)).
 - Retries, backoff and request expiry are all just due times. No due time means no automatic work: terminal, waiting on settlement (`PAID`), or waiting on a person (`UNKNOWN`, `MISMATCH`).
 
 Webhooks and Postgres `LISTEN/NOTIFY` only wake workers sooner. NOTIFY is best effort (lost on disconnect or failover), so the table plus polling is the guarantee; a worker polls immediately whenever it re-establishes LISTEN.
@@ -127,12 +127,14 @@ When a downstream is down, every payment that waits on it fails its next call. T
 
 | Option | What it does | Verdict |
 |---|---|---|
-| Back off per payment, up to a horizon | Failed sends and unanswered status queries keep the payment in its state; the wait doubles from 30 seconds to a 10-minute limit; only an outage longer than the horizon (2 hours by default) leads to `UNKNOWN`; any status answer ends an outage | Chosen and built. Removes the manual work for any outage shorter than the horizon, with no new state and no shared state |
+| Back off per payment, up to a horizon | Failed sends and unanswered status queries keep the payment in its state; the wait doubles from 30 seconds to a 10-minute limit; only an outage longer than the horizon (2 hours by default) leads to `UNKNOWN`; a status answer that finds the payment, or any state change, ends an outage | Chosen and built. Removes the manual work for any outage shorter than the horizon, with no new state and no shared state |
 | Circuit breaker per downstream | Stops new sends and pauses retries while the downstream is known to be down; probes, then resumes | Next step. Saves load and failed calls, but on its own does not resolve anything |
 | `UNKNOWN` re-checks itself | `UNKNOWN` gets a long backoff and asks the downstream again before a person looks | Worth adding later as the safety net after the horizon. Changes what `UNKNOWN` means, and needs a transition back to the waiting state |
 | Bulk reconciliation after recovery | Matches a downstream report or statement against everything affected | Belongs to reconciliation; needed for downstreams that cannot answer status queries |
 
 With backoff, the same 30-minute outage needs nobody: lost webhooks are recovered by asking, sends that never arrived are resent under the same key, and each payment makes at most 8 failed calls. The horizon is per downstream and must be shorter than its idempotency key retention, because a resend after the outage relies on the key still being known. A send that failed while the downstream answers status queries with "not found" is retried the same way: the downstream says it never arrived.
+
+How each failure recovers, with and without a downstream status endpoint, and the full list of what still needs a person, are in [recovery.md](recovery.md).
 
 **Scheduled singletons** (reconciliation runs, statement matching, partition maintenance) need one runner at a time: ShedLock or db-scheduler recurring tasks.
 
@@ -237,7 +239,7 @@ Payment records are financial records, so the legal obligation to keep them prot
 
 ## Evidence from the proof of concept
 
-The core loop was built and exercised against a real PostgreSQL: the state machine, ingestion with deduplication, the worker with lease and fenced writes, the provider inbox, and one fake downstream that can delay, duplicate, reorder, reject and time out. It shows the recommended design holds under the failures that matter, and it changed the recommendation in these places:
+The core loop was built and exercised against a real PostgreSQL: the state machine, ingestion with deduplication, the worker with lease and fenced writes, the provider inbox, and one fake downstream that can delay, duplicate, reorder, reject, time out and go down. It shows the recommended design holds under the failures that matter, and it changed the recommendation in these places:
 
 - **Duplicate submission, out-of-order events, timeout to `UNKNOWN`, takeover mid-send and amount invariants** all behave as specified, including with several workers racing. Each safeguard was checked by breaking it on purpose.
 - **The state machine needs a context.** A bare state forgot how far a payment got after a timeout or a cancellation; the downstream position and the cancellation flag fixed that.
@@ -259,5 +261,6 @@ Independent code reviews of the PoC found each of these before it could matter. 
 - **Claim query performance** needs a rewrite that finds due rows and rows with inputs separately before any load test.
 - **Downstream key semantics** decide whether a resend is safe: key retention, what a repeated key returns, and its format. Get them from the first downstream's owners and test them before building its adapter.
 - **Volumes and latency targets** are not in the brief. One primary is enough at the volumes the brief implies, but that needs a load test with a synchronous standby before go-live.
-- **Reconciliation and manual resolution** of `UNKNOWN` and `MISMATCH` are where operations will live day to day; design them with operations early.
+- **Reconciliation and manual resolution** of `UNKNOWN` and `MISMATCH` are where operations will live day to day; design them with operations early. [recovery.md](recovery.md) lists every cause.
+- **Downstreams without a status endpoint** recover through key-based resends, event replay, reports and statements, and more of their failures need a person ([recovery.md](recovery.md#without-a-status-endpoint-designed)).
 - **Front doors, validation rules and screening** are scoped by the questions at the top, and need partners and the bank's risk functions.

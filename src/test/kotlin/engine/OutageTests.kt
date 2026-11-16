@@ -155,7 +155,7 @@ class OutageTests {
     }
 
     @Test
-    fun `a send that fails while status queries work is resent under the same key, never UNKNOWN`() {
+    fun `a send that fails while status queries work is resent under the same key once the send endpoint is back`() {
         downstream.sendAvailable = false
         val id = submit("E1")
         drain()
