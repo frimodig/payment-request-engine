@@ -154,7 +154,7 @@ Answer aloud before opening each one.
 
 <details><summary>Why Postgres and polling instead of Kafka or a queue?</summary>
 
-The work is state, not messages: every payment needs a lifecycle, an audit trail, timeouts and fenced writes, and those live in a database anyway. A broker would add a second place for truth and a dual-write problem. Due times in a table give retries, backoff and timeouts for free, and `SKIP LOCKED` lets workers share it. The limit is the primary's throughput; the architecture says to measure it and split roles only when a bottleneck is measured. `LISTEN/NOTIFY` only wakes workers sooner; polling is the guarantee.
+The work is state, not messages: every payment needs a lifecycle, an audit trail, timeouts and fenced writes, and those live in a database anyway. A broker next to the database would add a second place for truth and a dual write. A persistent topic could be the only store instead, with no duplication, but the status API, the due times and reconciliation need a queryable database anyway, so Kafka would add a dependency for little value. Due times in a table give retries, backoff and timeouts for free, and `SKIP LOCKED` lets workers share it. The limit is the primary's throughput; the architecture says to measure it and split roles only when a bottleneck is measured. `LISTEN/NOTIFY` only wakes workers sooner; polling is the guarantee.
 </details>
 
 <details><summary>What stops a payment being paid twice?</summary>
@@ -189,7 +189,7 @@ One database means a modular monolith: microservices sharing a schema give the c
 
 <details><summary>What happens if the synchronous standby is unreachable?</summary>
 
-Stop acknowledging. Zero data loss means acknowledging only after the commit is replicated. Partners resend, and the idempotency rules make that safe.
+Nothing stops, because there are two synchronous-capable standbys and a commit needs only one of them (quorum `ANY 1`). A commit's wait for a standby ignores `statement_timeout`, and cancelling it reports success for a row that may not be replicated, so commits are bounded on the client and a timed-out commit is "outcome unknown", never acknowledged. Partners resend, and the idempotency rules make that safe.
 </details>
 
 <details><summary>What does the outbox give you that sending after the commit does not?</summary>

@@ -68,10 +68,10 @@ The proof of concept stores these but its core loop does not read `acceptance_mo
 | `id` | uuid | pk |
 | `partner_id` | uuid | fk `partner`; uq with `message_id` |
 | `channel` | text | `API` or `FILE` |
-| `message_id` | text | The partner's message id. A resend of the same message is a no-op |
+| `message_id` | text | The partner's message id. The recommendation: the same id with the same file hash is a duplicate, with a different hash a conflict. The PoC instead adds new instructions under a reused id to the existing submission |
 | `received_at` | timestamptz | |
 | `file_object_key` | text | Object storage key of the received file (personal data, see below) |
-| `declared_count`, `declared_sum_minor` | integer, bigint | Control totals declared by a file |
+| `declared_count`, `declared_sum_minor` | integer, bigint | Control totals declared by a file. The recommendation stores the sum as an exact decimal, since ISO sums amounts across currencies |
 | `status` | text | `RECEIVED`, `SPLIT` or `REJECTED` |
 
 ### payment_request
@@ -269,9 +269,9 @@ Debtor and creditor identification lives in `payment_request`, not in `payment_e
 - Received files in object storage (`submission.file_object_key`).
 - Free-text `reason` fields: guidance for operators is to use references, not personal details.
 
-Downstream calls are made by the worker directly, under its lease, not through the outbox; request bodies are not stored.
+Downstream calls are made by the worker directly, under its lease, not by the dispatcher; a `FORWARD_CANCELLATION` row records the effect, and the worker makes the call when it finds the row. Request bodies are not stored. Database error messages can carry a whole row, so the recommendation logs terse errors and treats database logs, backups and WAL archives as personal data.
 
-Payment records are kept for the legal retention period, and an erasure request during that period restricts their use rather than deleting them ([architecture.md](architecture.md#retention-and-erasure)). Deletion runs under the maintenance role at the end of the period: partitions are dropped and received files deleted. Data no obligation covers, such as delivered outbox payloads, is redacted in place (`'{}'`) on its own shorter schedule or on request.
+Payment records are kept for the legal retention period, and an erasure request during that period restricts their use rather than deleting them ([architecture.md](architecture.md#retention-and-erasure)). Deletion runs under the maintenance role at the end of the period: a month is dropped once every payment created in it is final and past the period, and received files are deleted. Data no obligation covers, such as delivered outbox payloads, is redacted in place (`'{}'`) on its own shorter schedule or on request.
 
 ## Transactions
 
@@ -287,4 +287,15 @@ Claiming is its own short transaction: one `UPDATE ... WHERE id = (SELECT ... FO
 - Per-downstream in-flight limits and the capability matrix.
 - Monthly partition management (scheduled job).
 - Grants enforcing the append-only and status-only rules.
+
+## Changes the recommendation makes (designed, not in the migrations)
+
+The second adversarial review of the plan led to these schema changes. Each is in [architecture.md](architecture.md); none is in V1 or V2.
+
+- **Integrity.** `UPDATE` on `payment_request` only for the lifecycle, lease and downstream columns, with a trigger keeping the instruction columns immutable. A unique event sequence per payment: today the primary key `(payment_id, seq, recorded_at)` lets two events share a sequence. A deferred trigger that refuses a state change without its event, a composite foreign key `(manual_action_id, payment_id)` that also requires an approved action, a hash chain over each payment's events, and a daily consistency job.
+- **Partitioning by creation month.** Every child table carries the payment's creation month and is partitioned by it, including `outbox` and `provider_inbox`; no default partition; partitions created at least three months ahead. Foreign-key columns are indexed.
+- **Deduplication key table.** `(partner_id, end_to_end_id)` in its own unpartitioned table, so it outlives archiving; the content hash is dropped after the legal period.
+- **Money.** The currency exponent stored with each amount; a running total of received credits per request; the amount-modification terms, charge bearer and requested execution date read by the rules.
+- **Operations.** A failure count per payment for quarantine, an under-review flag with its start date, a restriction flag for erasure requests, a per-partner in-flight counter, and a table of paused or blocked downstreams and partners.
+- **States.** `NOT_PAID`, `PAID_LATE`, `SCREENING_REVIEW` and `QUARANTINED`, and the transition-table version on each event.
 - A raw-message column on `provider_inbox`, and a source timestamp on events.

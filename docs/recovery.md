@@ -57,10 +57,14 @@ How each failure resolves:
 | Webhooks repeated or out of order | Event for a state already passed | Recorded as stale; the graph, not the clock, decides | Built |
 | Webhook before the reference is known | Event matches no payment | Parked, linked when the reference is stored | Built |
 | Downstream down | Status query fails or throws | Backoff up to the horizon (2 h by default); a status answer that finds the payment ends the outage | Built |
-| Database failover | Connections drop | Work is idempotent per transaction; leases expire and workers reclaim; nothing is acknowledged before it is on the synchronous standby | Designed |
+| Database failover | Connections drop | Work is idempotent per transaction; leases expire and workers reclaim; only a synchronous standby is promoted, so nothing acknowledged is lost | Designed |
+| A standby is lost | Nothing visible to partners | Quorum commit over two standbys keeps writes going; a commit that times out waiting is "outcome unknown", never success | Designed |
+| Database restored to an earlier point | Payments after the restore point are gone, but the downstream may have them | Stop all sends; ask the downstream about every payment touched since the restore point minus a margin; partner resends carry the same downstream key | Designed |
+| A payment fails every time it is claimed (poison) | Exceptions on claim | A failure count backs it off; after a set number it is `QUARANTINED` for a person, with an alert | Designed |
+| A downstream's planned maintenance | Announced window | Pause sends to that downstream and freeze its outage horizon; status queries continue | Designed |
 | Worker wake-up lost (`NOTIFY`) | Nothing visible | Workers poll; `NOTIFY` only wakes them sooner | Designed (the PoC polls) |
 | Effect not delivered (partner status, cancellation forward, alert) | `outbox` row with no `delivered_at` | Written in the state change's transaction; a dispatcher retries until it is delivered | Outbox built, dispatcher designed |
-| Partner's webhook endpoint down | Delivery fails | Retry with backoff; the partner can poll the status API meanwhile | Designed |
+| Partner's webhook endpoint down | Delivery fails | Retry with backoff in that partner's own lane; after a maximum delivery age, stop and point the partner at the status API and its "changes since" feed | Designed |
 
 ## Without a status endpoint (designed)
 
@@ -83,7 +87,7 @@ In code this is one more answer from the adapter (status not supported), a per-d
 
 ## What needs a person
 
-Each item lands in a queue with an owner and an alert. The person checks with the downstream or the statements, then records a manual action, which a second person approves and the worker applies through the state machine. Manual actions are designed, not built.
+Each item lands in a queue with a named owning team, an alert and a published resolution time. The person checks with the downstream or the statements, then records one of a defined set of manual actions with its evidence, which a second person approves and the worker applies through the state machine. While it waits, the partner sees the last status with an under-review flag. Manual actions are designed, not built.
 
 ### `UNKNOWN`: we cannot tell what happened
 
@@ -104,9 +108,20 @@ Each item lands in a queue with an owner and an alert. The person checks with th
 |---|---|---|
 | An event with no path from the current state, such as a cancellation we never asked for, or one confirmed after the debtor accepted | The downstream says something our record says cannot happen | Built |
 | A reject, refusal, expiry or cancellation after `PAID` | Money came back, or should never have moved; partners are not told until a person decides | Built |
-| A settlement amount that differs from the request, or several credits for one request | Money moved, but not as asked | Designed |
+| Credits whose running total stays short of the request's amount rule past the deadline, or goes over it | Money moved, but not as asked | Designed |
 
 `MISMATCH` never changes on its own and ignores later events.
+
+### Other states that wait on a person
+
+| State | Cause | Status |
+|---|---|---|
+| `SCREENING_REVIEW` | A potential sanctions or AML match; a two-person decision | Designed |
+| `QUARANTINED` | A payment that failed on every claim | Designed |
+
+### Not a person: partner-visible outcomes
+
+A request accepted but not paid by its deadline becomes `NOT_PAID`, and money that arrives after a not-paid final state becomes `PAID_LATE`. Both go to the partner, not to a queue (designed).
 
 ### Alerts with no state change
 
@@ -117,6 +132,8 @@ Each item lands in a queue with an owner and an alert. The person checks with th
 | Provider events parked with no matching payment past a deadline | Designed |
 | Effects or partner deliveries failing past a limit | Designed |
 | A downstream file rejected whole, or a report not arriving | Designed |
+| Statement credits that match no request | Designed |
+| A scheduled job that missed its run, or too few future partitions | Designed |
 
 ### Not a person, but a known gap
 
@@ -128,4 +145,4 @@ Each item lands in a queue with an owner and an alert. The person checks with th
 1. **Circuit breaker per downstream.** During an outage, new sends wait instead of each failing once. After it, a warm-up ramps the rate up so the recovering downstream is not flooded, oldest waiting payments first.
 2. **`UNKNOWN` re-checks itself** on a long backoff before a person looks.
 3. **Reports and statements resolve `UNKNOWN` automatically,** for every downstream, not only those without a status endpoint.
-4. **Bulk manual actions** after an incident, so one approved decision can resolve many payments with the same cause.
+4. **Bulk manual actions by cause,** in the first release, so one approved decision can resolve many payments with the same cause. The list of payments is frozen when the action is requested.

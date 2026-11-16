@@ -16,6 +16,17 @@ The proof of concept built the core loop (CLAUDE.md lists its scope) to check th
 - Internal request expiry. A downstream can still report `EXPIRED`. A downstream that keeps reporting the status we already know keeps a payment waiting indefinitely.
 - `LISTEN/NOTIFY`. Workers poll.
 
+## Designed after the second plan review, not built
+
+The second adversarial review of the plan ([review-findings.md](review-findings.md#second-adversarial-review-of-the-plan)) added designs the proof of concept does not have. The ones that change its behaviour:
+
+- The schema has no integrity controls: the application role can update any column, and the event sequence is not unique.
+- `ACCEPTED` times out to `UNKNOWN`; the design moves it to `NOT_PAID` at a business deadline instead. There is no `PAID_LATE`, `SCREENING_REVIEW` or `QUARANTINED`, and no running total of credits.
+- The downstream key is the random payment id plus the attempt, so it would not survive a database restore; the design derives it from the partner's own ids.
+- A reused message id adds instructions to the existing submission instead of being rejected as a conflict.
+- The event table is partitioned by recorded time and has a default partition.
+- There is no failure count: a payment that fails on every claim retries every lease period.
+
 ## Behaviour gaps
 
 - **Too-late cancellation is silent.** A cancellation that arrives after acceptance (or when already requested, or on a `MISMATCH`) is recorded as a technical `STALE` event and marked applied. The partner is not told it was refused. Telling them needs a new partner status, and published statuses are forever.

@@ -24,6 +24,38 @@ After the code reviews, two independent challengers reviewed the recommendation 
 | The claim-query figures cannot be reproduced from the repository | Labelled as a one-off measurement |
 | Product, scheme, build-or-buy, volumes, ownership and the Postgres-versus-workflow-engine choice | Left open on purpose for the exercise; volumes and downstream key semantics are listed as risks |
 
+## Second adversarial review of the plan
+
+Three independent challengers attacked the plan for gaps: operations and failure, the payment domain and partner contract, and security, data and scale. Two of them tested their claims on a throwaway local PostgreSQL. The user decided the eight open questions; every gap is now answered in the plan as a design, not in the proof of concept.
+
+| Gap | Outcome |
+|---|---|
+| One synchronous standby: losing it stops every write; a cancelled replication wait reports success; no RPO, RTO or restore plan | Two standbys with quorum commit, client-side commit timeout as "outcome unknown", targets and restore runbook ([architecture.md](architecture.md#data-availability-and-scale)) |
+| The application role can change amounts and history unseen; the event sequence is not unique | Column grants, immutable instruction columns, unique sequence, hash chain anchored in the security log, daily consistency job |
+| Partial or several credits are called normal but sent to `MISMATCH` | Running total; `SETTLED` when the total meets the request's amount rule |
+| Reconciliation has no workable matching or ownership | Statements a condition of onboarding; matching order; one credit per request; unmatched credits to the partner and an owner |
+| `ACCEPTED` never ends when the debtor does not pay; expiry has no owner; late money cannot correct a final state | `NOT_PAID` at a business deadline; expiry checked before each send and confirmed downstream; `PAID_LATE` |
+| The partner sees a reassuring status while a person investigates | Under-review flag with a date, and a published resolution time |
+| Status events cannot be ordered, fetched since a point, or trusted | Event sequence in every status, a "changes since" feed, a daily report, signed webhooks |
+| File partners cannot cancel; the pain.014 mapping is undefined | File cancellation per instruction and per submission; mapping in Step 0 |
+| Manual actions are undefined and bulk actions unbounded | A defined set with evidence, frozen bulk lists, identity-provider ids, value thresholds, a named owning team |
+| Poison payments retry forever | Failure count, backoff, `QUARANTINED` |
+| No way to stop sends to a downstream or to all | Per-downstream pause with the horizon frozen in maintenance windows; a global kill switch |
+| Fairness and backpressure are not expressible in the claim | Claim picks lane and partner first; "in flight" means leased now; 429 and delayed acknowledgements past a drain time |
+| No rule for deploying while payments are in flight | Expand, then contract; transition-table version on each event |
+| The outbox dispatcher has no ordering, lanes or maximum age, and the docs disagree on who forwards a cancellation | Lanes per effect and partner, maximum delivery age; the worker makes downstream calls |
+| Retention by partition drop splits a payment's history; partition upkeep can block writes | Partition by creation month; drop only when every payment is final; partitions three months ahead, no default partition |
+| Debtor data in database logs, backups and a forever-kept hash | Terse errors, logs and backups as personal data, hash dropped after the period |
+| A database restore breaks downstream deduplication | The downstream key derives from the partner's own ids |
+| A re-exported file with fresh ids is processed twice; a reused message id merges files | Possible-duplicate hold by file hash or totals; same message id with a different hash is a conflict |
+| Screening hits have no review state; reasons can tip off | `SCREENING_REVIEW` with a two-person decision; one generic compliance reason code |
+| XML parsing is not hardened | No DTDs or external entities, pinned schema, streaming limits |
+| NOTIFY inside state-change transactions makes commits wait for each other under synchronous replication | Wake-ups from a separate session, outside those transactions |
+| No rule for re-routing a payment or retiring a downstream | Bound at first send; drain before retirement |
+| A multi-currency control sum does not fit minor units; the currency exponent comes from the JDK | Control sum as an exact decimal; exponent stored with each amount |
+
+The review also corrected the platform slide's reason against Kafka: a persistent topic could be the only store, with no dual write, but the status API, due times and reconciliation need a queryable database anyway.
+
 ## Final review (max effort)
 
 | # | Finding | Outcome |
