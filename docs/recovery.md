@@ -125,7 +125,7 @@ Each item lands in a queue with an owner and an alert. The person checks with th
 
 ## Next steps to shrink the manual queue
 
-1. **Circuit breaker per downstream.** During an outage, new sends wait instead of each failing once, and recovery after the outage is paced.
+1. **Circuit breaker per downstream.** During an outage, new sends wait instead of each failing once. After it, a warm-up ramps the rate up so the recovering downstream is not flooded, oldest waiting payments first.
 2. **`UNKNOWN` re-checks itself** on a long backoff before a person looks.
 3. **Reports and statements resolve `UNKNOWN` automatically,** for every downstream, not only those without a status endpoint.
 4. **Bulk manual actions** after an incident, so one approved decision can resolve many payments with the same cause.
