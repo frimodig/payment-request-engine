@@ -7,15 +7,16 @@ A recommendation for how to build a partner payment processing engine: it receiv
 
 ## Contents
 
-- [docs/architecture.md](docs/architecture.md): the recommendation, structured around the brief, with the evidence from the proof of concept and the open risks.
-- [docs/database.md](docs/database.md): the recommended data model: tables, columns, indexes and the rules they enforce.
+- [docs/architecture.md](docs/architecture.md): the recommendation as one argument: key decisions, how a payment flows, the states and partner statuses, the evidence from the proof of concept, the risks and the first-release cut.
+- [docs/database.md](docs/database.md): the recommended data model: tables, columns, indexes and the rules they enforce, plus the claim, availability, partitioning, retention and integrity.
 - [docs/recovery.md](docs/recovery.md): how the engine recovers from failures, with and without a downstream status endpoint, and what still needs a person.
+- [docs/operations.md](docs/operations.md): how the engine is run: gates, manual actions and their queues, alerts, deploys, scheduled jobs and the platform.
 - [docs/poc-limits.md](docs/poc-limits.md): what the proof of concept does not cover, and its known gaps.
-- [docs/review-findings.md](docs/review-findings.md): what the code reviews and the adversarial review of the plan found, and what became of each finding.
+- [docs/review-findings.md](docs/review-findings.md): what the code reviews and the three reviews of the plan found, and what became of each finding.
 - [docs/threat-model.md](docs/threat-model.md): threats per trust boundary and the control for each.
 - [docs/poc-decisions.md](docs/poc-decisions.md): the decision log, with the reason for each choice.
 - [docs/study-guide.md](docs/study-guide.md): a guide to understanding and defending the recommendation: ideas, code reading order, exercises and practice questions.
-- [docs/architecture.png](docs/architecture.png): one-page diagram.
+- [docs/architecture.png](docs/architecture.png): one-page diagram. Its source is [docs/architecture.svg](docs/architecture.svg); after editing it, re-render the PNG (on macOS: `qlmanage -t -s 2142` on a square copy, then crop with `sips`).
 - `src/main/resources/db/migration`: the schema as Flyway migrations.
 - `src/main/kotlin`: the proof-of-concept core loop, no HTTP:
   - `State.kt`, `StateMachine.kt`: the pure state machine. Transitions return valid or invalid, side effects as data.

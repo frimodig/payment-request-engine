@@ -13,7 +13,7 @@ Everything hard about this comes from one fact: **the downstream systems are slo
 1. Never pay twice and never lose a payment: idempotency keys, one owner per payment at a time, writes that cannot overwrite a newer state.
 2. Never guess: when the outcome is unknown, say so (`UNKNOWN`), keep the evidence, and hand it to a person or to reconciliation. A timeout is never a failure.
 3. Be able to explain every status: an append-only event history, every effect recorded in the same transaction as the state change.
-4. Stay simple: one service, one database, due times instead of a queue broker.
+4. Stay simple: one service, one database, due times instead of a queue broker. The complexity is the domain's, and it lives in one state machine and one table of due work.
 
 Skim [architecture.md](architecture.md) first (the brief table at the top shows where each requirement is answered), then return here.
 
@@ -22,7 +22,7 @@ Skim [architecture.md](architecture.md) first (the brief table at the top shows 
 - **pain.013** is a Creditor Payment Activation Request: a *Request to Pay*. The creditor (our partner) asks the debtor to pay. **pain.014** is the status report that goes back. An accepted request is followed by a separate credit transfer, possibly several or a partial one. So the final status waits on a person (the debtor) and arrives asynchronously, in both phases. Phase 2 removes batching, not asynchrony.
 - **End-to-end id.** The partner's id for one instruction. With the partner it forms the idempotency key at the door: the same pair is the same instruction.
 - **camt.053 / camt.054** are account statements and notifications. They are how you check that what the engine believes happened actually happened (reconciliation).
-- **Downstream styles.** Synchronous API, asynchronous with webhooks, file-based, message-based. They differ only inside the adapter; see the table in [architecture.md](architecture.md#downstream-systems).
+- **Downstream styles.** Synchronous API, asynchronous with webhooks, file-based, message-based. The aim is for them to differ only inside the adapter; only the synchronous style was built. See the table in [architecture.md](architecture.md#downstream-systems).
 - **Amounts** are integers in minor units plus an ISO 4217 currency, because floats cannot represent money exactly and because currencies have different exponents (EUR has two decimals, JPY none).
 - **Published status values are forever.** Partners build on them, so only states that mean something to a partner are exposed.
 
@@ -34,9 +34,9 @@ Each idea: what it is, why it exists, where it lives, and the test that shows it
 
 ### 3.1 Every state with work has a due time
 
-Each payment row has `state` and `next_action_at`. There is one kind of work: claim a payment that is due or has a new input, apply the input or do the step the state calls for, write the new state and the next due time. No due time means no automatic work: terminal, waiting on settlement (`PAID`), or waiting on a person.
+Each payment row has `state` and `next_action_at`. There is one kind of work: claim a payment that is due or has a new input, apply the input or do the step the state calls for, write the new state and the next due time. No due time means no automatic work: a final state, or waiting on a person. Which states have a due time, and what it is, is in the [states table](architecture.md#states-and-partner-statuses). In the proof of concept `PAID` has none; the design gives it a settlement deadline.
 
-- *Why:* retries, backoff, timeouts and expiry are all "a due time". There is no separate scheduler, no queue broker, and a crashed worker loses nothing because the work is in the table.
+- *Why:* retries, backoff, timeouts, expiry and business deadlines are all "a due time". There is no separate scheduler, no queue broker, and a crashed worker loses nothing because the work is in the table.
 - *Where:* `Worker.runOnce`, `Worker.scheduleFor`, `State.hasAutomaticWork`.
 - *Proof:* the "no due time" rule is checked for every state in `StateMachineTest` ("only non-terminal non-waiting states have automatic work").
 
@@ -55,7 +55,7 @@ A state change writes the payment row, one `payment_event` row per step, one `ou
 
 - *Why:* if effects were sent after the commit, a worker dying in between would lose them. If sent before, a rollback would have announced something that did not happen. The outbox makes the effect durable with the state, and a dispatcher delivers it afterwards, retrying as needed.
 - *Where:* `Store.apply`, `Store.insertOutbox`, table `outbox` in [database.md](database.md#outbox).
-- *Not built:* the dispatcher. Only the writing side exists.
+- *Not built:* delivery. Only the writing side exists. In the design, partner statuses go through a dispatcher, cancellation forwards through the worker, and alerts and reconciliation rows through their own consumers ([database.md](database.md#outbox-1)).
 
 ### 3.4 The state machine is pure
 
@@ -77,11 +77,12 @@ A provider event names a target state. The machine compares it with the payment'
 | Not reachable, or the payment was never sent | `NO_PATH`: the payment goes to `MISMATCH` and an alert is raised |
 
 - *Why:* timestamps from other systems lie (clock skew, retries). The state graph is the only thing both sides agree on.
+- *Design change:* a `PAID` event after `REFUSED`, `EXPIRED`, `CANCELLED` or `NOT_PAID` is not stale in the design: money arrived, so the payment moves to `PAID_LATE` ([architecture.md](architecture.md#settlement-and-reconciliation)).
 - *Proof:* "out-of-order and duplicated provider events end in PAID with each partner status once", "an event that contradicts the state parks the payment as MISMATCH with an alert".
 
 ### 3.6 Idempotency key and the takeover rules
 
-The key sent to the downstream is `paymentId:sendAttempt`. It is derived from the payment, never from the worker, so a different worker that takes over sends the same key and the downstream deduplicates.
+The key the proof of concept sends to the downstream is `paymentId:sendAttempt`. It is derived from the payment, never from the worker, so a different worker that takes over sends the same key and the downstream deduplicates. The design derives it from the partner, the end-to-end id and the attempt instead, hashed into the downstream's format, so it also survives a database restore ([database.md](database.md#payment_request-1)).
 
 `SENDING` is recorded **before** the call. So a worker that finds an overdue `SENDING` payment knows a call may have happened, and checks the downstream instead of resending:
 
@@ -90,7 +91,7 @@ The key sent to the downstream is `paymentId:sendAttempt`. It is derived from th
 | Knows it | any | Store the reference; apply any reported state |
 | Does not know it | no | It never arrived: resend under the same key |
 | Does not know it | yes | It accepted it once and lost it: `UNKNOWN`, never a resend |
-| No answer, or its adapter fails | any | An outage: back off and retry, `UNKNOWN` only after the outage horizon |
+| No answer, or its adapter fails | any | An outage: back off and retry. The proof of concept moves the payment to `UNKNOWN` after the outage horizon; the design does that only when we hold no reference |
 
 - *Where:* `Worker.checkSending`, `Worker.unreachable`, `Worker.sendAndRecord`.
 - *Proof:* "a worker that dies after recording SENDING is taken over and resends under the same key", "a worker that died after the downstream accepted is taken over without a second send", "no blind resend when the downstream has lost a payment it once accepted".
@@ -101,7 +102,7 @@ A timeout moves a payment to `UNKNOWN`, never to a failure state, and `UNKNOWN` 
 
 - *Why:* a failed payment may be retried or reported as failed to the partner. If it actually went through, that is a double payment or a lie.
 - *Proof:* "a timeout nobody can explain is UNKNOWN, queued for reconciliation, and never turns into failed", "when the response window passes the downstream is asked, and a lost PAID webhook is recovered".
-- *Outages are different:* a downstream that does not answer is down, not unknown. The worker backs off (30 seconds, doubling to 10 minutes) and only moves the payment to `UNKNOWN` once the outage outlasts the horizon. Proof: `OutageTests`.
+- *Outages are different:* a downstream that does not answer is down, not unknown. The worker backs off (30 seconds, doubling to 10 minutes) and only moves the payment to `UNKNOWN` once the outage outlasts the horizon. Proof: `OutageTests`. The design narrows this: only a payment that may need a resend has a horizon, because a resend is safe only while the downstream keeps the key; an acknowledged payment keeps backing off ([recovery.md](recovery.md#downstream-outages)).
 
 ### 3.8 The provider inbox: store first, apply later
 
@@ -159,17 +160,17 @@ The work is state, not messages: every payment needs a lifecycle, an audit trail
 
 <details><summary>What stops a payment being paid twice?</summary>
 
-Three layers. The door deduplicates on (partner, end-to-end id). Only the lease holder changes a payment, and its write is fenced on the lease token and event sequence. And the downstream receives `paymentId:attempt` as an idempotency key that is derived from the payment, never the worker, so a takeover sends the same key. On top of that, a payment the downstream has already accepted is never resent: it goes to `UNKNOWN`.
+Three layers. The door deduplicates on (partner, end-to-end id). Only the lease holder changes a payment, and its write is fenced on the lease token and event sequence. And the downstream receives an idempotency key derived from the partner, the end-to-end id and the attempt, never from the worker, so a takeover sends the same key, and so does a resend after a database restore. (The proof of concept uses `paymentId:attempt`, which survives a takeover but not a restore.) On top of that, a payment the downstream has already accepted is never resent: it goes to `UNKNOWN`.
 </details>
 
 <details><summary>A call to the downstream times out. What happens?</summary>
 
-The outcome is unknown, so the worker asks the downstream by the idempotency key. If it knows the payment, the reference is stored and the payment keeps waiting. If it does not, and we hold no reference, it never arrived and the same key is sent again. If the status call is unavailable, it is retried with backoff until the outage horizon, then the payment becomes `UNKNOWN` and a reconciliation effect is queued. It never becomes a failure.
+The outcome is unknown, so the worker asks the downstream by the idempotency key. If it knows the payment, the reference is stored and the payment keeps waiting. If it does not, and we hold no reference, it never arrived and the same key is sent again. If the status call is unavailable, it is retried with backoff. A payment we hold no reference for may need a resend, so it becomes `UNKNOWN` at the outage horizon, and a reconciliation effect is queued; one the downstream has acknowledged keeps backing off while a person is alerted about the downstream. It never becomes a failure.
 </details>
 
 <details><summary>What is the difference between UNKNOWN and MISMATCH?</summary>
 
-`UNKNOWN`: we lost track of the outcome (silence). A late event can still resolve it, from the last known position. `MISMATCH`: the downstream said something that contradicts what we know (no path in the graph). It is frozen and goes to a person with an alert. Both have no due time and wait on a person.
+`UNKNOWN`: we lost track of the outcome (silence). A late event can still resolve it, from the last known position. `MISMATCH`: two sources disagree, such as a downstream event with no path in the graph, or a statement that contradicts the downstream. It is frozen and goes to a person with an alert. Both have no due time and wait on a person.
 </details>
 
 <details><summary>Why are events resolved by the state graph and not by timestamps?</summary>
@@ -187,9 +188,9 @@ A file is a bulk API call with the same idempotency rules. Granularity is not th
 One database means a modular monolith: microservices sharing a schema give the costs of both. Every instance runs every job; roles are split only where a measured bottleneck says so. The state machine, the worker and the adapters are modules with clear boundaries, which keeps the option open.
 </details>
 
-<details><summary>What happens if the synchronous standby is unreachable?</summary>
+<details><summary>What happens if a synchronous standby is unreachable?</summary>
 
-Nothing stops, because there are two synchronous-capable standbys and a commit needs only one of them (quorum `ANY 1`). A commit's wait for a standby ignores `statement_timeout`, and cancelling it reports success for a row that may not be replicated, so commits are bounded on the client and a timed-out commit is "outcome unknown", never acknowledged. Partners resend, and the idempotency rules make that safe.
+Nothing stops, because there are two synchronous standbys, each in a different zone from the primary and from each other, and a commit needs only one of them (quorum `ANY 1`). So losing a node or a zone loses no acknowledged commit. A commit's wait for a standby ignores `statement_timeout`, and cancelling it reports success for a row that may not be replicated, so commits are bounded on the client and a timed-out commit is "outcome unknown", never acknowledged. Partners resend, and the idempotency rules make that safe.
 </details>
 
 <details><summary>What does the outbox give you that sending after the commit does not?</summary>
@@ -199,7 +200,7 @@ Atomicity. The effect is stored with the state change, so a worker dying right a
 
 <details><summary>How do you cancel a payment that is already in flight?</summary>
 
-Before the send it is cancelled at once and never sent. In flight it becomes `CANCELLATION_REQUESTED` and the cancellation is forwarded. The debtor may accept first; then the payment follows to `ACCEPTED` and the cancellation lost. Only a cancellation we asked for can be confirmed as `CANCELLED`, and not after acceptance. A request that arrives too late is recorded as stale; telling the partner it was refused needs a new status that is not defined yet.
+Before the send it is cancelled at once and never sent. In flight it becomes `CANCELLATION_REQUESTED` and the cancellation is forwarded. The debtor may accept first; then the payment follows to `ACCEPTED` and the cancellation lost. Only a cancellation we asked for can be confirmed as `CANCELLED`, and not after acceptance. Expiry uses the same path, recording who asked. Silence after the forward follows the waiting rules, never a final status. A request that arrives too late gets a refusal status in the design; the proof of concept only records it as stale.
 </details>
 
 <details><summary>What does the proof of concept NOT prove?</summary>
@@ -209,7 +210,7 @@ No HTTP or file front door, no outbox dispatcher, no reconciliation or manual re
 
 <details><summary>What would you build first, and what is the biggest risk?</summary>
 
-First the blocking step 0: canonical model, transition table, event schema, status vocabulary and the contracts, then the core lifecycle with the first downstream and its simulator. The biggest risks are operational: resolving `UNKNOWN` and `MISMATCH` and reconciliation (where operations will spend their days), and the status vocabulary, which is a contract that is hard to change once published.
+First the blocking step 0: canonical model, transition table, event schema, status vocabulary and the contracts, then the core lifecycle with the first downstream and its simulator. The first release is a pilot with one partner, one downstream with a status endpoint and one front door; what it holds, and what is added on which trigger, is in [architecture.md](architecture.md#delivery-and-the-first-release). The biggest risks are throughput under quorum commit, which is unmeasured, and operations: resolving `UNKNOWN` and `MISMATCH` and reconciliation (where operations will spend their days), and the status vocabulary, which is a contract that is hard to change once published.
 </details>
 
 ## 7. Glossary
@@ -227,9 +228,10 @@ First the blocking step 0: canonical model, transition table, event schema, stat
 | Stale | An event recorded but not applied because it is behind or equal to what we know |
 | Inferred | A state skipped by an event, recorded as passed through |
 | `UNKNOWN` | We lost track of the outcome; waits on a person or a late event |
-| `MISMATCH` | The downstream contradicts our state; frozen and alerted |
-| `PAID` / `SETTLED` | The downstream reports the payment made / reconciliation confirms the money in the partner's account. Only `SETTLED` is final |
-| Outage horizon | How long a downstream may stay unreachable before its payments go to a person |
+| `MISMATCH` | Two sources disagree (the downstream and our state, or the statement and the downstream); frozen and alerted |
+| `PAID` / `SETTLED` | The downstream reports the payment made / reconciliation confirms the money in the partner's account. `PAID` is not final and `SETTLED` is, except that `PAID` is final for a partner onboarded without statement access |
+| Outage horizon | How long a downstream may stay unreachable before a payment that may need a resend goes to a person. Pauses, the kill switch and maintenance windows freeze it, never past the downstream's key retention |
+| Gate | A per-downstream, per-partner or global row that can hold back sends, and only sends |
 | Reconciliation | Comparing what we believe with account statements (camt.053/054) |
 | Request to Pay | pain.013: the creditor asks the debtor to pay; the payment is a separate step |
 
@@ -244,3 +246,4 @@ First the blocking step 0: canonical model, transition table, event schema, stat
 | What the reviews found and what became of it | [review-findings.md](review-findings.md) |
 | Threats and their controls | [threat-model.md](threat-model.md) |
 | How failures recover, and what needs a person | [recovery.md](recovery.md) |
+| Gates, manual actions, queues, alerts and deploys | [operations.md](operations.md) |

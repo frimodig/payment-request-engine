@@ -5,10 +5,10 @@ The proof of concept built the core loop (CLAUDE.md lists its scope) to check th
 ## Not built
 
 - Front doors: no HTTP API and no file parser. `Ingestion.submit` is the call both would make, and it ingests a whole submission in one transaction: the staged, chunked file ingestion the recommendation describes is not built. Acceptance is partial only; all-or-nothing is not implemented.
-- Validation and screening are pass-through steps. Partner pause and in-flight limits (`partner.paused`, `max_in_flight`) are not read.
+- Validation and screening are pass-through steps. Partner pause and in-progress limits (`partner.paused`, `max_in_flight`) are not read.
 - Manual actions and resolution of `UNKNOWN` and `MISMATCH`. Both wait for a person. A late downstream event resolves `UNKNOWN`; nothing resolves `MISMATCH`, which ignores every later event. `UNKNOWN` does not re-check the downstream on its own.
 - Reconciliation against statements. `SETTLED` arrives through the provider inbox like any downstream event; in production reconciliation produces it. Events carry no amount, so a partial or repeated credit is not detected, and nothing alerts on a payment that stays `PAID`.
-- A circuit breaker and warm-up. During an outage each payment backs off on its own, and new payments are still sent into it, each failing once before it backs off. After the outage, retries resume at full rate rather than ramping up.
+- A circuit breaker and warm-up (designed for later). During an outage each payment backs off on its own, and new payments are still sent into it, each failing once before it backs off. After the outage, retries resume at full rate rather than ramping up.
 - Jitter on the backoff. The waits are exact, so payments that enter an outage together retry together.
 - Downstream styles other than synchronous. There is one fake downstream, and it keeps every idempotency key forever and answers a repeated key with the original result. A downstream that answers a repeated key with a reject would make the PoC record `REJECTED`.
 - Outbox dispatching. Every effect is written to `outbox` in the same transaction as the state change; nothing delivers them (partner webhooks, forwarding a cancellation, reconciliation, alerts). `WebhookTarget` decides which partner URLs may be called, but nothing stores a partner's URL or calls it, so connecting only to the checked addresses and refusing redirects is not exercised. It allows any port on a public address, so a partner could point the engine at another party's mail or database port; limiting ports (for example to 443 and 8443) or the egress proxy is left to delivery.
@@ -16,16 +16,20 @@ The proof of concept built the core loop (CLAUDE.md lists its scope) to check th
 - Internal request expiry. A downstream can still report `EXPIRED`. A downstream that keeps reporting the status we already know keeps a payment waiting indefinitely.
 - `LISTEN/NOTIFY`. Workers poll.
 
-## Designed after the second plan review, not built
+## Designed after the plan reviews, not built
 
-The second adversarial review of the plan ([review-findings.md](review-findings.md#second-adversarial-review-of-the-plan)) added designs the proof of concept does not have. The ones that change its behaviour:
+The second and third adversarial reviews of the plan ([review-findings.md](review-findings.md#second-adversarial-review-of-the-plan), [third review](review-findings.md#third-review-does-the-plan-make-sense)) changed designs the proof of concept already has. Where the code and the plan differ:
 
-- The schema has no integrity controls: the application role can update any column, and the event sequence is not unique.
-- `ACCEPTED` times out to `UNKNOWN`; the design moves it to `NOT_PAID` at a business deadline instead. There is no `PAID_LATE`, `SCREENING_REVIEW` or `QUARANTINED`, and no running total of credits.
-- The downstream key is the random payment id plus the attempt, so it would not survive a database restore; the design derives it from the partner's own ids.
-- A reused message id adds instructions to the existing submission instead of being rejected as a conflict.
-- The event table is partitioned by recorded time and has a default partition.
-- There is no failure count: a payment that fails on every claim retries every lease period.
+- **Integrity.** The schema has no integrity controls: the application role can update any column, and the event sequence is not unique.
+- **States.** There is no `NOT_PAID`, `PAID_LATE`, `SCREENING_REVIEW` or `QUARANTINED` ([states table](architecture.md#states-and-partner-statuses)). `ACCEPTED` times out to `UNKNOWN`; the design asks the downstream at a business deadline, then moves it to `NOT_PAID` or `MISMATCH`. `PAID` has no settlement deadline. A `PAID` event after `CANCELLED` is stale with an alert; the design moves it to `PAID_LATE`. There is no running total of credits.
+- **The outage horizon applies to every payment.** The design applies it only to payments that may need a resend; an acknowledged payment keeps backing off. Nothing freezes the horizon, and nothing checks it against the downstream's key retention.
+- **No gates.** There is no per-downstream or per-partner pause, no global kill switch and no maintenance-window freeze ([operations.md](operations.md#gates)). `partner.paused` and `max_in_flight` are not read. The downstream is stored when `SENDING` is recorded, not at routing.
+- **The downstream key** is the random payment id plus the attempt, so it would not survive a database restore; the design derives it from the partner's own ids. The attempt increments only on the first send, which matches the design's attempt rule, but there is no manual resend.
+- **Cancellation.** Expiry does not forward a cancellation, and the context does not record who asked.
+- **The claim** looks for provider events and cancellations only; the design also takes approved manual actions, statement matches and undelivered cancellation forwards. There is no failure count: a payment that fails on every claim retries every lease period.
+- **A reused message id** adds instructions to the existing submission instead of being rejected as a conflict.
+- **Partitioning.** The event table is partitioned by recorded time and has a default partition; the design partitions only `payment_event`, by the payment's creation month, with none.
+- **The currency exponent** comes from the JDK (`Money.kt`) instead of being stored with each amount.
 
 ## Behaviour gaps
 

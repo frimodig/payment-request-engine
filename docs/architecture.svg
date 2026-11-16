@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 2000 1160" width="2000" height="1160" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" fill="#2d3340">
+  <!-- Source of docs/architecture.png. Edit this file, then re-render the PNG (see README). -->
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#4a5160"/>
+    </marker>
+    <style>
+      .box { fill: #ffffff; stroke: #4a5160; stroke-width: 2.5; }
+      .t { font-size: 24px; font-weight: 700; text-anchor: middle; }
+      .s { font-size: 21px; text-anchor: middle; }
+      .h { font-size: 27px; font-weight: 700; text-anchor: middle; }
+      .l { font-size: 18px; text-anchor: middle; fill: #4a5160; }
+      .line { fill: none; stroke: #4a5160; stroke-width: 2.5; marker-end: url(#arrow); }
+      .dash { stroke-dasharray: 9 7; }
+    </style>
+  </defs>
+  <rect width="2000" height="1160" fill="#ffffff"/>
+
+  <!-- Partners -->
+  <rect x="46" y="58" width="271" height="1020" rx="18" fill="#eaf2fb" stroke="#9db5d6" stroke-width="2.5"/>
+  <text x="182" y="105" class="h">Partners</text>
+  <rect x="68" y="183" width="228" height="116" rx="12" class="box"/>
+  <text x="182" y="236" class="t">Partner system</text><text x="182" y="264" class="s">API client</text>
+  <rect x="68" y="367" width="228" height="116" rx="12" class="box"/>
+  <text x="182" y="420" class="t">Partner ERP</text><text x="182" y="448" class="s">file export</text>
+  <rect x="68" y="905" width="228" height="116" rx="12" class="box"/>
+  <text x="182" y="958" class="t">Partner</text><text x="182" y="986" class="s">webhook endpoint</text>
+
+  <!-- Engine -->
+  <rect x="366" y="58" width="1169" height="1020" rx="18" fill="#edf5ec" stroke="#9cc79a" stroke-width="2.5"/>
+  <text x="950" y="105" class="h">Payment engine: one service, N identical instances</text>
+
+  <rect x="394" y="180" width="240" height="122" rx="12" class="box"/>
+  <text x="514" y="225" class="t">API ingress</text><text x="514" y="253" class="s">sync validation</text><text x="514" y="279" class="s">202 or clear error</text>
+  <rect x="394" y="364" width="240" height="122" rx="12" class="box"/>
+  <text x="514" y="409" class="t">File adapter</text><text x="514" y="437" class="s">store, dedupe, ack,</text><text x="514" y="463" class="s">split into rows</text>
+  <rect x="394" y="547" width="240" height="122" rx="12" class="box"/>
+  <text x="514" y="592" class="t">Admin portal</text><text x="514" y="620" class="s">maker-checker,</text><text x="514" y="646" class="s">reason required</text>
+  <rect x="394" y="902" width="240" height="122" rx="12" class="box"/>
+  <text x="514" y="947" class="t">Partner notifier</text><text x="514" y="975" class="s">signed webhooks,</text><text x="514" y="1001" class="s">pain.014, status API</text>
+
+  <rect x="781" y="272" width="425" height="159" rx="12" fill="#dcefd9" stroke="#4a5160" stroke-width="2.5"/>
+  <text x="993" y="318" class="t">Worker loop + state machine</text>
+  <text x="993" y="347" class="s">claim due work (lease, fenced write)</text>
+  <text x="993" y="374" class="s">forward: apply | backward: record</text>
+  <text x="993" y="401" class="s">no path: mismatch</text>
+
+  <rect x="1227" y="141" width="296" height="104" rx="12" class="box"/>
+  <text x="1375" y="185" class="t">Checks</text><text x="1375" y="213" class="s">screening, limits</text>
+  <rect x="1227" y="318" width="296" height="104" rx="12" class="box"/>
+  <text x="1375" y="362" class="t">Downstream adapters</text><text x="1375" y="390" class="s">one per provider, gated</text>
+  <rect x="1350" y="489" width="185" height="92" rx="12" class="box"/>
+  <text x="1442" y="527" class="t">Provider inbox</text><text x="1442" y="555" class="s">store raw, ack</text>
+
+  <!-- PostgreSQL -->
+  <rect x="631" y="596" width="768" height="299" rx="14" fill="#fbf4e4" stroke="#d9c48f" stroke-width="2.5"/>
+  <g>
+    <path d="M646 686 v116 a89 14 0 0 0 178 0 v-116" class="box"/><ellipse cx="735" cy="686" rx="89" ry="14" class="box"/>
+    <text x="735" y="742" class="t" style="font-size:22px">outbox</text><text x="735" y="768" class="s" style="font-size:19px">side effects</text>
+    <path d="M837 686 v116 a89 14 0 0 0 178 0 v-116" class="box"/><ellipse cx="926" cy="686" rx="89" ry="14" class="box"/>
+    <text x="926" y="730" class="t" style="font-size:20px">payment_request</text><text x="926" y="756" class="s" style="font-size:19px">state,</text><text x="926" y="780" class="s" style="font-size:19px">next_action_at</text>
+    <path d="M1028 686 v116 a89 14 0 0 0 178 0 v-116" class="box"/><ellipse cx="1117" cy="686" rx="89" ry="14" class="box"/>
+    <text x="1117" y="742" class="t" style="font-size:20px">payment_event</text><text x="1117" y="768" class="s" style="font-size:19px">append-only</text>
+    <path d="M1212 686 v116 a89 14 0 0 0 178 0 v-116" class="box"/><ellipse cx="1301" cy="686" rx="89" ry="14" class="box"/>
+    <text x="1301" y="742" class="t" style="font-size:20px">provider_inbox</text><text x="1301" y="768" class="s" style="font-size:19px">raw events</text>
+  </g>
+  <text x="1015" y="862" class="t" style="font-size:22px">PostgreSQL: primary + two synchronous standbys (quorum)</text>
+
+  <rect x="895" y="948" width="357" height="103" rx="12" class="box"/>
+  <text x="1073" y="992" class="t">Scheduled jobs</text><text x="1073" y="1020" class="s">reconciliation, partitions, retention</text>
+
+  <!-- Bank services and downstreams -->
+  <rect x="1584" y="58" width="369" height="147" rx="18" fill="#f0f0f0" stroke="#b3b3b3" stroke-width="2.5"/>
+  <text x="1768" y="100" class="h">Bank services</text>
+  <rect x="1609" y="126" width="320" height="60" rx="12" class="box"/>
+  <text x="1769" y="164" class="s">Sanctions / AML / fraud</text>
+
+  <rect x="1584" y="241" width="369" height="441" rx="18" fill="#f5eef8" stroke="#c9a3d6" stroke-width="2.5"/>
+  <text x="1768" y="286" class="h">Downstream</text><text x="1768" y="318" class="h">payment systems</text>
+  <rect x="1658" y="337" width="221" height="91" rx="12" class="box"/>
+  <text x="1768" y="376" class="t">Provider A</text><text x="1768" y="404" class="s">sync API</text>
+  <rect x="1658" y="453" width="221" height="91" rx="12" class="box"/>
+  <text x="1768" y="492" class="t">Provider B</text><text x="1768" y="520" class="s">async + webhooks</text>
+  <rect x="1658" y="569" width="221" height="91" rx="12" class="box"/>
+  <text x="1768" y="608" class="t">Provider C</text><text x="1768" y="636" class="s">file based</text>
+  <text x="1768" y="714" class="l">webhooks and status files arrive</text>
+  <text x="1768" y="737" class="l">out of order, into the provider inbox</text>
+
+  <rect x="1584" y="853" width="369" height="225" rx="18" fill="#f0f0f0" stroke="#b3b3b3" stroke-width="2.5"/>
+  <text x="1768" y="896" class="h">Bank services</text>
+  <rect x="1646" y="938" width="246" height="98" rx="12" class="box"/>
+  <text x="1769" y="980" class="t">Statements</text><text x="1769" y="1008" class="s">camt.053 / 054</text>
+
+  <!-- Arrows -->
+  <path d="M296 241 H386" class="line"/><text x="338" y="224" class="l">pain.013</text>
+  <path d="M296 425 H386" class="line"/><text x="338" y="408" class="l">SFTP</text>
+  <path d="M634 241 L898 668" class="line"/>
+  <path d="M634 428 L905 668" class="line"/>
+  <path d="M634 608 C690 610 760 640 840 680" class="line"/><rect x="652" y="562" width="150" height="26" fill="#edf5ec"/><text x="727" y="581" class="l">manual_action</text>
+  <path d="M957 668 V439" class="line dash"/><rect x="872" y="520" width="66" height="50" fill="#ffffff"/><text x="905" y="540" class="l">due /</text><text x="905" y="562" class="l">NOTIFY</text>
+  <path d="M1075 433 L1112 664" class="line"/><rect x="1000" y="517" width="196" height="50" fill="#ffffff"/><text x="1098" y="537" class="l">state + event + outbox</text><text x="1098" y="559" class="l">in one transaction</text>
+  <path d="M1270 666 C1255 560 1215 490 1180 439" class="line dash"/>
+  <path d="M1207 340 C1222 300 1222 250 1229 210" class="line"/>
+  <path d="M1207 365 H1221" class="line"/>
+  <path d="M1523 190 L1601 160" class="line"/>
+  <path d="M1523 368 L1650 382" class="line"/>
+  <path d="M1523 372 L1650 492" class="line"/>
+  <path d="M1523 376 L1650 606" class="line"/>
+  <path d="M1658 500 C1610 505 1570 515 1541 528" class="line"/>
+  <path d="M1658 612 C1610 600 1570 570 1541 548" class="line"/>
+  <path d="M1442 581 C1440 630 1415 660 1388 680" class="line"/>
+  <path d="M700 814 C672 850 650 880 638 898" class="line"/>
+  <path d="M394 963 H304" class="line"/>
+  <path d="M1252 998 L1638 988" class="line"/>
+
+  <text x="1000" y="1118" style="font-size:21px; font-style:italic; text-anchor:middle; fill:#4a5160">Every state with automatic work has a due time. Workers claim what is due or has a new input; webhooks and NOTIFY only wake them sooner.</text>
+</svg>
