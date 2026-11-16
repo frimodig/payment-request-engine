@@ -152,20 +152,32 @@ class Store(private val db: Db, private val clock: Clock, private val leaseFor: 
         }
     }
 
-    /** How many events of [type] came since the last event of any other type: the length of the current streak. */
-    fun consecutiveEvents(paymentId: UUID, type: String): Int = db.tx { conn ->
+    /**
+     * The run of [types] events at the end of the payment's history: how many there are and when the first happened.
+     * The run ends at any other event that changed something, or at a status answer even when it changed nothing,
+     * because the downstream answered. A repeated webhook that changed nothing does not end it: webhooks can arrive
+     * while status queries fail. Null when there is no run.
+     */
+    fun currentStreak(paymentId: UUID, types: Set<String>): Streak? = db.tx { conn ->
         conn.prepareStatement(
             """
-            SELECT count(*) FROM payment_event
-             WHERE payment_id = ? AND type = ?
-               AND seq > COALESCE((SELECT max(seq) FROM payment_event WHERE payment_id = ? AND type <> ?), 0)
+            SELECT count(*), min(occurred_at) FROM payment_event
+             WHERE payment_id = ? AND type = ANY (?)
+               AND seq > COALESCE((SELECT max(seq) FROM payment_event
+                                    WHERE payment_id = ? AND NOT type = ANY (?)
+                                      AND (outcome <> 'STALE' OR type = 'STATUS_QUERY')), 0)
             """.trimIndent(),
         ).use { ps ->
+            val typeArray = conn.createArrayOf("text", types.toTypedArray())
             ps.setObject(1, paymentId)
-            ps.setString(2, type)
+            ps.setArray(2, typeArray)
             ps.setObject(3, paymentId)
-            ps.setString(4, type)
-            ps.executeQuery().use { rs -> rs.next(); rs.getInt(1) }
+            ps.setArray(4, typeArray)
+            ps.executeQuery().use { rs ->
+                rs.next()
+                val count = rs.getInt(1)
+                if (count == 0) null else Streak(count, rs.getObject(2, java.time.OffsetDateTime::class.java).toInstant())
+            }
         }
     }
 
@@ -287,3 +299,6 @@ class Store(private val db: Db, private val clock: Clock, private val leaseFor: 
             "p.currency, p.downstream, p.downstream_ref, p.send_attempt, p.next_action_at, p.lease_token, p.event_seq"
     }
 }
+
+/** A run of events of the same kind, such as the failed calls of one downstream outage. */
+data class Streak(val count: Int, val startedAt: Instant)

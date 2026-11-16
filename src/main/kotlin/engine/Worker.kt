@@ -12,9 +12,15 @@ class WorkerConfig(
     val workerId: String,
     /** How long a payment may wait for a downstream answer before the worker acts on the silence. */
     val responseWindow: Duration = Duration.ofMinutes(5),
-    /** How long to wait before asking an unavailable status endpoint again, and how many times, before UNKNOWN. */
-    val statusRetryDelay: Duration = Duration.ofSeconds(30),
-    val statusRetries: Int = 3,
+    /** The first wait after a downstream call failed. Each further failure in the same outage doubles it. */
+    val retryDelay: Duration = Duration.ofSeconds(30),
+    /** The longest wait between retries while a downstream stays unreachable. */
+    val maxRetryDelay: Duration = Duration.ofMinutes(10),
+    /**
+     * How long a downstream may stay unreachable before its payments go to a person as UNKNOWN. Keep it well inside
+     * the downstream's idempotency key retention: a resend after this long must still be deduplicated.
+     */
+    val outageHorizon: Duration = Duration.ofHours(2),
 )
 
 /**
@@ -96,14 +102,15 @@ class Worker(
         val result = try {
             downstream.send(SendRequest(p.idempotencyKey, p.id, p.amount, p.endToEndId))
         } catch (e: Exception) {
-            // Whatever went wrong, the outcome is unknown, never failed. Query the status if possible: if the
-            // downstream has the payment we learn its reference and keep waiting; otherwise UNKNOWN, which queues
-            // reconciliation. Only the exception class is kept: its message could carry data from the downstream.
+            // Whatever went wrong, the outcome is unknown, never failed. Ask the downstream: if it has the payment we
+            // learn its reference and keep waiting. If it has nothing, or cannot answer, the downstream is unreachable
+            // for now: stay in SENDING and try again later under the same key. Only the exception class is kept: its
+            // message could carry data from the downstream.
             val payload = """{"error":${jsonString(e.javaClass.simpleName)}}"""
             return when (val known = statusOf(p)) {
                 is StatusResult.Known -> recordReference(p, known.downstreamRef, "SEND_TIMEOUT_RECOVERED")
-                StatusResult.Unavailable -> statusUnavailable(p, "SEND_TIMEOUT", payload)
-                StatusResult.NotFound -> transition(p, ResponseTimeout, "SEND_TIMEOUT", worker, payload = payload)
+                StatusResult.Unavailable -> unreachable(p, "STATUS_UNAVAILABLE", "SEND_TIMEOUT", payload)
+                StatusResult.NotFound -> unreachable(p, "SEND_FAILED", "SEND_TIMEOUT", payload)
             }
         }
         return when (result) {
@@ -133,31 +140,44 @@ class Worker(
         // reference proves it accepted the payment, so a downstream that cannot find it now is for a person.
         StatusResult.NotFound ->
             if (p.downstreamRef == null) sendAndRecord(p) else transition(p, ResponseTimeout, "RESPONSE_TIMEOUT", worker)
-        StatusResult.Unavailable -> statusUnavailable(p, "RESPONSE_TIMEOUT", null)
+        StatusResult.Unavailable -> unreachable(p, "STATUS_UNAVAILABLE", "RESPONSE_TIMEOUT", null)
     }
 
-    // The downstream could not answer a status query. One outage is not yet a reason for a person to look: ask again
-    // a few times, staying in SENDING, and only then treat the silence as UNKNOWN. [type] and [payload] describe the
-    // timeout that is recorded if the retries are used up.
-    private fun statusUnavailable(p: Payment, type: String, payload: String?): Payment {
-        if (store.consecutiveEvents(p.id, "STATUS_UNAVAILABLE") >= config.statusRetries) {
-            return transition(p, ResponseTimeout, type, worker, payload = payload)
+    // The downstream could not be reached: a status query went unanswered, or a send failed and the downstream has
+    // nothing. That is an outage, not an unknown outcome, so it is not yet a reason for a person to look. Stay in the
+    // same state and try again, doubling the wait each time up to a limit. Only an outage that outlasts the horizon
+    // moves the payment to UNKNOWN; [timeoutType] and [payload] describe that timeout. The last wait ends at the
+    // horizon, so a person hears about it on time.
+    private fun unreachable(p: Payment, type: String, timeoutType: String, payload: String?): Payment {
+        val now = clock.instant()
+        val outage = store.currentStreak(p.id, OUTAGE_EVENTS)
+        val horizon = (outage?.startedAt ?: now).plus(config.outageHorizon)
+        if (!now.isBefore(horizon)) {
+            return transition(p, ResponseTimeout, timeoutType, worker, payload = payload)
         }
         return store.apply(
             p,
             Change(
-                type = "STATUS_UNAVAILABLE",
+                type = type,
                 actor = Actor("DOWNSTREAM", downstream.name),
                 steps = listOf(Step(p.state, p.state, Outcome.STALE)),
                 context = p.context,
-                nextActionAt = clock.instant().plus(config.statusRetryDelay),
+                nextActionAt = minOf(now.plus(backoff(failuresSoFar = outage?.count ?: 0)), horizon),
+                payload = payload,
             ),
         )
     }
 
+    // 30 s, 1 min, 2 min, 4 min ... up to the configured limit.
+    private fun backoff(failuresSoFar: Int): Duration =
+        config.retryDelay.multipliedBy(1L shl failuresSoFar.coerceAtMost(20)).coerceAtMost(config.maxRetryDelay)
+
     private companion object {
         const val MAX_REFERENCE = 200
         const val UNIQUE_VIOLATION = "23505"
+
+        /** One downstream outage, however it showed itself. [Store.currentStreak] says which events end it. */
+        val OUTAGE_EVENTS = setOf("STATUS_UNAVAILABLE", "SEND_FAILED")
     }
 
     // A downstream's reason code is stored as it came, minus what the database cannot hold (control characters such as
@@ -180,7 +200,7 @@ class Worker(
             }
         }
         StatusResult.NotFound -> transition(p, ResponseTimeout, "RESPONSE_TIMEOUT", worker)
-        StatusResult.Unavailable -> statusUnavailable(p, "RESPONSE_TIMEOUT", null)
+        StatusResult.Unavailable -> unreachable(p, "STATUS_UNAVAILABLE", "RESPONSE_TIMEOUT", null)
     }
 
     // Never throws: an adapter that fails to answer is an unavailable downstream.

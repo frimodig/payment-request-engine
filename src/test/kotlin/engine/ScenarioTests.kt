@@ -21,6 +21,7 @@ class ScenarioTests {
     private val db = TestPostgres.db
     private val tables = Tables(db)
     private val window = Duration.ofMinutes(5)
+    private val horizon = WorkerConfig("any").outageHorizon
     private val store = Store(db, clock, Duration.ofMinutes(1))
     private val ingestion = Ingestion(db, clock)
     private val inbox = ProviderInbox(db, clock)
@@ -203,11 +204,8 @@ class ScenarioTests {
         downstream.script(SendBehavior.TimeoutBeforeProcessing)
         val id = submit("E1")
         drain(worker("A"))
-        // The status query is retried a few times first: one outage is not yet a reason for a person to look.
-        repeat(5) {
-            clock.advance(Duration.ofSeconds(31))
-            drain(worker("A"))
-        }
+        // The status query is retried with backoff first: an outage is not yet a reason for a person to look.
+        clock.keepRunning(horizon.plusMinutes(1)) { drain(worker("A")) }
         assertUnknown(id)
 
         val eventsBefore = tables.events(id)
@@ -226,10 +224,7 @@ class ScenarioTests {
         // Silence: the response window passes and the downstream does not answer the status query either.
         downstream.statusAvailable = false
         clock.advance(window.plusSeconds(1))
-        repeat(5) {
-            drain(worker("A"))
-            clock.advance(Duration.ofSeconds(31))
-        }
+        clock.keepRunning(horizon.plusMinutes(1)) { drain(worker("A")) }
         assertUnknown(id)
         downstream.statusAvailable = true
 

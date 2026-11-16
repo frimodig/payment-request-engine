@@ -115,3 +115,13 @@ class Tables(private val db: Db) {
         }
     }
 }
+
+/** Runs [work] every [step] until [duration] has passed on the clock, the way a polling worker would. */
+fun MutableClock.keepRunning(duration: Duration, step: Duration = Duration.ofMinutes(1), work: () -> Unit) {
+    val end = now.plus(duration)
+    while (now.isBefore(end)) {
+        work()
+        advance(step)
+    }
+    work()
+}

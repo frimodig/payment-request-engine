@@ -25,6 +25,7 @@ class HardeningTests {
     private val tables = Tables(db)
     private val window = Duration.ofMinutes(5)
     private val retryDelay = Duration.ofSeconds(30)
+    private val horizon = WorkerConfig("any").outageHorizon
     private val store = Store(db, clock, Duration.ofMinutes(1))
     private val ingestion = Ingestion(db, clock)
     private val inbox = ProviderInbox(db, clock)
@@ -215,7 +216,7 @@ class HardeningTests {
         drain(worker("A"))
         downstream.statusAvailable = false
         clock.advance(window.plusSeconds(1))
-        repeat(5) { drain(worker("A")); clock.advance(retryDelay.plusSeconds(1)) }
+        clock.keepRunning(horizon.plusMinutes(1)) { drain(worker("A")) }
         assertEquals("UNKNOWN", tables.payment(id).state)
         downstream.statusAvailable = true
 
@@ -227,7 +228,7 @@ class HardeningTests {
     }
 
     @Test
-    fun `an unavailable status answer is retried a few times before the payment becomes UNKNOWN`() {
+    fun `an unavailable status answer is retried, and the reference is learned once the downstream answers`() {
         downstream.statusAvailable = false
         downstream.script(SendBehavior.TimeoutAfterProcessing)
         val id = submit("E1")
@@ -276,25 +277,30 @@ class HardeningTests {
     }
 
     @Test
-    fun `status outages are counted per outage, not over the whole life of the payment`() {
+    fun `outages are measured per outage, not over the whole life of the payment`() {
+        val outage = setOf("STATUS_UNAVAILABLE", "SEND_FAILED")
         submit("E1")
         var p = assertNotNull(store.claim("A"))
-        fun unavailable() {
+        fun failed(type: String) {
             p = store.apply(
                 p,
-                Change("STATUS_UNAVAILABLE", Actor("DOWNSTREAM", "fake"), listOf(Step(p.state, p.state, Outcome.STALE)), p.context, clock.instant()),
+                Change(type, Actor("DOWNSTREAM", "fake"), listOf(Step(p.state, p.state, Outcome.STALE)), p.context, clock.instant()),
             )
         }
-        unavailable()
-        unavailable()
-        assertEquals(2, store.consecutiveEvents(p.id, "STATUS_UNAVAILABLE"))
+        val firstStart = clock.instant()
+        failed("STATUS_UNAVAILABLE")
+        clock.advance(Duration.ofMinutes(1))
+        failed("SEND_FAILED")
+        assertEquals(Streak(2, firstStart), store.currentStreak(p.id, outage), "both kinds of failure are one outage")
         // Something else happens, so the outage is over.
         p = store.apply(
             p,
             Change("VALIDATED", Actor("SERVICE", "A"), listOf(Step(State.RECEIVED, State.VALIDATED, Outcome.APPLIED)), Context(State.VALIDATED), clock.instant()),
         )
-        unavailable()
-        assertEquals(1, store.consecutiveEvents(p.id, "STATUS_UNAVAILABLE"))
+        assertEquals(null, store.currentStreak(p.id, outage))
+        clock.advance(Duration.ofMinutes(1))
+        failed("STATUS_UNAVAILABLE")
+        assertEquals(Streak(1, clock.instant()), store.currentStreak(p.id, outage))
     }
 
     @Test
@@ -359,14 +365,14 @@ class HardeningTests {
     }
 
     @Test
-    fun `a status call that throws is treated as unavailable, then UNKNOWN`() {
+    fun `a status call that throws is treated as unavailable, then UNKNOWN once the outage outlasts the horizon`() {
         downstream.statusThrows = true
         downstream.script(SendBehavior.TimeoutAfterProcessing)
         val id = submit("E1")
         drain(worker("A"))
         assertEquals("SENDING", tables.payment(id).state)
         assertTrue(tables.events(id).any { it.type == "STATUS_UNAVAILABLE" })
-        repeat(5) { clock.advance(retryDelay.plusSeconds(1)); drain(worker("A")) }
+        clock.keepRunning(horizon.plusMinutes(1)) { drain(worker("A")) }
         assertEquals("UNKNOWN", tables.payment(id).state)
     }
 

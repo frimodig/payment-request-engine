@@ -38,6 +38,9 @@ class FakeDownstream(override val name: String = "fake") : Downstream {
 
     @Volatile var statusAvailable = true
 
+    /** False makes every send fail before it reaches the downstream, like a send endpoint that is down. */
+    @Volatile var sendAvailable = true
+
     /** Makes [status] throw instead of answering, like a broken network adapter. */
     @Volatile var statusThrows = false
 
@@ -59,6 +62,7 @@ class FakeDownstream(override val name: String = "fake") : Downstream {
 
     override fun send(request: SendRequest): SendResult {
         sendCalls.incrementAndGet()
+        if (!sendAvailable) throw DownstreamTimeout("unreachable")
         val behavior = script.pollFirst() ?: SendBehavior.Normal
         when (behavior) {
             SendBehavior.TimeoutBeforeProcessing -> throw DownstreamTimeout("no response")
