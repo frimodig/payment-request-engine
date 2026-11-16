@@ -127,12 +127,12 @@ When a downstream is down, every payment that waits on it fails its next call. T
 
 | Option | What it does | Verdict |
 |---|---|---|
-| Back off per payment, up to a horizon | Failed sends and unanswered status queries keep the payment in its state; the wait doubles from 30 seconds to a 10-minute limit; only an outage longer than the horizon (2 hours by default) leads to `UNKNOWN`; a status answer that finds the payment, or any state change, ends an outage | Chosen and built. Removes the manual work for any outage shorter than the horizon, with no new state and no shared state |
+| Back off per payment, up to a horizon | Failed sends and unanswered status queries keep the payment in its state; the wait doubles from 30 seconds to a 10-minute limit, with jitter so payments caught in the same outage don't retry in lockstep; only an outage longer than the horizon (2 hours by default) leads to `UNKNOWN`; a status answer that finds the payment, or any state change, ends an outage | Chosen and built, except the jitter. Removes the manual work for any outage shorter than the horizon, with no new state and no shared state |
 | Circuit breaker per downstream | Stops new sends and pauses retries while the downstream is known to be down; probes, then resumes | Next step. Saves load and failed calls, but on its own does not resolve anything |
 | `UNKNOWN` re-checks itself | `UNKNOWN` gets a long backoff and asks the downstream again before a person looks | Worth adding later as the safety net after the horizon. Changes what `UNKNOWN` means, and needs a transition back to the waiting state |
 | Bulk reconciliation after recovery | Matches a downstream report or statement against everything affected | Belongs to reconciliation; needed for downstreams that cannot answer status queries |
 
-With backoff, the same 30-minute outage needs nobody: lost webhooks are recovered by asking, sends that never arrived are resent under the same key, and each payment makes at most 8 failed calls. The horizon is per downstream and must be shorter than its idempotency key retention, because a resend after the outage relies on the key still being known. A send that failed while the downstream answers status queries with "not found" is retried the same way: the downstream says it never arrived.
+With backoff, the same 30-minute outage needs nobody: lost webhooks are recovered by asking, sends that never arrived are resent under the same key, and each payment makes at most 8 failed attempts. The horizon is per downstream and must be shorter than its idempotency key retention, because a resend after the outage relies on the key still being known. A send that failed while the downstream answers status queries with "not found" is retried the same way: the downstream says it never arrived.
 
 How each failure recovers, with and without a downstream status endpoint, and the full list of what still needs a person, are in [recovery.md](recovery.md).
 
