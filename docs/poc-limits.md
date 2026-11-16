@@ -90,3 +90,8 @@ Measured by the final review, not fixed:
 - `FakeDownstream` does not record a scripted reject, so it is not idempotent for rejections.
 - No deterministic test covers the live-lease predicate in `Store.claim`; only the concurrent test would catch it, and only when the race occurs. `HardeningTests` uses a short sleep to hold a transaction open.
 - `.gitignore` ignores `/bin/` only; nested `bin/` directories of a future module would show as untracked.
+
+## Open in the design
+
+- **The restore runbook needs more detail** before it can be rehearsed: it should record the highest attempt the downstream knows, cover payments re-created by re-ingestion, choose the payments to jump from the delivery log rather than a margin, log each sequence before delivery rather than after, and say how workers are made to ask now. A decision is also open on whether re-ingested instructions keep the instruction id partners already hold.
+- **For partners without statement access**, whether a reject after their final `PAID` is a `MISMATCH` or stale with an alert is not yet decided, and the partner's statement access is not yet in the state machine's context.

@@ -35,7 +35,7 @@ A person never writes a payment's state. Each manual action is an input: request
 | Retry or close a quarantined payment | `QUARANTINED` | Its previous state with the count reset; or `REJECTED` with a reason if it was never sent, else `UNKNOWN` | The cause, fixed or understood |
 | Release or reject a held file | A submission `HELD` as a possible duplicate | `SPLIT` or `REJECTED`, applied by ingestion to the submission, not by the payment worker | Comparison with the earlier file, or the partner's confirmation |
 | Match a credit by hand | An unmatched statement credit | A statement match for the payment, applied like any other | The statement entry |
-| Cancel a payment the downstream never had | `UNKNOWN` with a cancellation pending | `CANCELLED` | The downstream confirms it never received it |
+| Cancel a payment the downstream never had | `UNKNOWN` with a cancellation pending | `CANCELLED`, or `EXPIRED` if expiry asked | The downstream confirms it never received it |
 
 - `SETTLED` is never set by hand: it is reached only through a matched statement entry.
 - **Maker-checker:** identities from the identity provider (subject ids, not names), a reason, and an extra approver above a value threshold.

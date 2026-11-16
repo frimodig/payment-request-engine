@@ -98,7 +98,7 @@ The key the proof of concept sends to the downstream is `paymentId:sendAttempt`.
 
 ### 3.7 Unknown never expires into failed
 
-A timeout moves a payment to `UNKNOWN`, never to a failure state, and `UNKNOWN` has no due time: it waits for a person, a reconciliation, or a late event that resolves it. Before giving up, the worker asks the downstream (`Worker.checkWaiting`): if it moved on, the payment is caught up; if it still reports the same status, the payment keeps waiting; only silence leads to `UNKNOWN`.
+A timeout moves a payment to `UNKNOWN`, never to a failure state, and `UNKNOWN` has no due time (in the design, until its expiry): it waits for a person, a reconciliation, or a late event that resolves it. Before giving up, the worker asks the downstream (`Worker.checkWaiting`): if it moved on, the payment is caught up; if it still reports the same status, the payment keeps waiting; only silence leads to `UNKNOWN`.
 
 - *Why:* a failed payment may be retried or reported as failed to the partner. If it actually went through, that is a double payment or a lie.
 - *Proof:* "a timeout nobody can explain is UNKNOWN, queued for reconciliation, and never turns into failed", "when the response window passes the downstream is asked, and a lost PAID webhook is recovered".
@@ -170,7 +170,7 @@ The outcome is unknown, so the worker asks the downstream by the idempotency key
 
 <details><summary>What is the difference between UNKNOWN and MISMATCH?</summary>
 
-`UNKNOWN`: we lost track of the outcome (silence). A late event can still resolve it, from the last known position. `MISMATCH`: two sources disagree, such as a downstream event with no path in the graph, or a statement that contradicts the downstream. It is frozen and goes to a person with an alert. Both have no due time and wait on a person.
+`UNKNOWN`: we lost track of the outcome (silence). A late event can still resolve it, from the last known position. `MISMATCH`: two sources disagree, such as a downstream event with no path in the graph, or a statement that contradicts the downstream. It is frozen and goes to a person with an alert. `MISMATCH` has no due time; `UNKNOWN` has one only until its expiry. Both wait on a person.
 </details>
 
 <details><summary>Why are events resolved by the state graph and not by timestamps?</summary>
