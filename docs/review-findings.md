@@ -26,7 +26,7 @@ After the code reviews, two independent challengers reviewed the recommendation 
 
 ## Second adversarial review of the plan
 
-Three independent challengers attacked the plan for gaps: operations and failure, the payment domain and partner contract, and security, data and scale. Two of them tested their claims on a throwaway local PostgreSQL. The user decided the eight open questions; every gap is now answered in the plan as a design, not in the proof of concept.
+Three independent challengers attacked the plan for gaps: operations and failure, the payment domain and partner contract, and security, data and scale. Two of them tested their claims on a throwaway local PostgreSQL. I decided the eight open questions; every gap is now answered in the plan as a design, not in the proof of concept.
 
 | Gap | Outcome |
 |---|---|
@@ -58,7 +58,7 @@ The review also corrected the platform slide's reason against Kafka: a persisten
 
 ## Third review: does the plan make sense
 
-After the second review's answers were written into the plan, two independent reviewers read it again. One checked whether the documents are coherent with each other and with the proof of concept, and tested its partitioning claims on a throwaway local PostgreSQL. The other judged whether it still makes sense as one design, and what a first release needs. Both found the same root cause: answers had been added beside the old text, so the plan contradicted itself and read as a spec with patches. The user approved ten decisions ([poc-decisions.md](poc-decisions.md), items 28 to 38), and the plan was rewritten rather than patched again: [architecture.md](architecture.md) is one argument with one table of states, and the detail moved to one home each, including a new [operations.md](operations.md).
+After the second review's answers were written into the plan, two independent reviewers read it again. One checked whether the documents are coherent with each other and with the proof of concept, and tested its partitioning claims on a throwaway local PostgreSQL. The other judged whether it still makes sense as one design, and what a first release needs. Both found the same root cause: answers had been added beside the old text, so the plan contradicted itself and read as a spec with patches. I approved ten decisions ([poc-decisions.md](poc-decisions.md), items 28 to 38), and the plan was rewritten rather than patched again: [architecture.md](architecture.md) is one argument with one table of states, and the detail moved to one home each, including a new [operations.md](operations.md).
 
 ### Coherence
 

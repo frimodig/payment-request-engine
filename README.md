@@ -26,6 +26,10 @@ A recommendation for how to build a partner payment processing engine: it receiv
   - `WebhookTarget.kt`: decides whether a partner's webhook URL may be called (no internal addresses).
 - `src/test`: unit tests, and scenario tests against a real Postgres.
 
+## How it was built
+
+I designed the recommendation and built the proof of concept with Claude Code, using my own agent workflow: agents implement small slices, separate reviewer agents check each one from a narrow angle, and every finding ends in a fix with a test or a documented limit. `/code-review` in the logs is Claude Code's review command. The decisions are mine; [docs/poc-decisions.md](docs/poc-decisions.md) records each one and why.
+
 ## Build
 
 Requires JDK 21 and Docker (for Testcontainers).
